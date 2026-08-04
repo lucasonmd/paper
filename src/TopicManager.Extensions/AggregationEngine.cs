@@ -45,8 +45,15 @@ namespace TopicManager.Extensions
         public ConcurrentDictionary<long, ImmutableHashSet<long>> Forward { get; } = new(); // ToKey -> FromKeys
         public ConcurrentDictionary<long, ImmutableHashSet<long>> Reverse { get; } = new();
 
+        // Serializes index writers per relation; readers stay lock-free.
+        public object WriteGate { get; } = new object();
+
         // If set, link validity requires reciprocal match.
         public RelationDef? Reciprocal { get; set; }
+
+        // True for the R->L half of a bidirectional pair. Used only when
+        // AggregationEngine.IsolateAggregateBoundaries is enabled.
+        public bool IsReciprocalSecondary { get; set; }
 
         public RelationDef(string name, KindId from, KindId to, Multiplicity mult, Func<object, IEnumerable<long>> getToKeysFromFrom)
         {
@@ -73,7 +80,9 @@ namespace TopicManager.Extensions
         {
             if (_byKind.TryGetValue(kind, out var list))
             {
-                items = list.Cast<T>().ToArray();
+                var arr = new T[list.Count];
+                for (int i = 0; i < list.Count; i++) arr[i] = (T)list[i];
+                items = arr;
                 return true;
             }
             items = Array.Empty<T>();
@@ -97,16 +106,63 @@ namespace TopicManager.Extensions
         private readonly ConcurrentDictionary<Type, KindId> _typeToKind = new();
         private int _nextKind = 0;
         private readonly ConcurrentDictionary<KindId, KindDef> _kinds = new();
-        private readonly ConcurrentDictionary<KindId, List<RelationDef>> _relsByFrom = new();
-        private readonly ConcurrentDictionary<KindId, List<RelationDef>> _relsByTo = new();
+        private readonly ConcurrentDictionary<KindId, ImmutableList<RelationDef>> _relsByFrom = new();
+        private readonly ConcurrentDictionary<KindId, ImmutableList<RelationDef>> _relsByTo = new();
         private readonly ConcurrentDictionary<KindId, bool> _rootKinds = new();
-        private readonly ConcurrentDictionary<RootId, object> _gateByRoot = new();
+
+        // Per-root emission state: computation gate + FIFO queue so that
+        // subscriber callbacks run outside the gate (see EmitIfComplete).
+        private sealed class RootEmitState
+        {
+            public readonly object Gate = new object();
+            public readonly Queue<PendingEmit> Pending = new();
+            public bool Draining;
+        }
+
+        private readonly struct PendingEmit
+        {
+            public readonly AggregateSnapshot Snapshot;
+            public readonly Action<RootId, AggregateSnapshot>? Global;
+            public readonly Action<RootId, AggregateSnapshot>[] Handlers;
+
+            public PendingEmit(AggregateSnapshot snapshot, Action<RootId, AggregateSnapshot>? global, Action<RootId, AggregateSnapshot>[] handlers)
+            {
+                Snapshot = snapshot;
+                Global = global;
+                Handlers = handlers;
+            }
+        }
+
+        private readonly ConcurrentDictionary<RootId, RootEmitState> _emitByRoot = new();
+
+        // Last emitted member set per root; populated only while
+        // SuppressUnchangedSnapshots is enabled.
+        private readonly ConcurrentDictionary<RootId, Dictionary<EntityId, object>> _lastEmitted = new();
 
         // Root-kind routing handlers
         private readonly ConcurrentDictionary<KindId, List<Action<RootId, AggregateSnapshot>>> _rootKindHandlers = new();
 
         // Global event
         public event Action<RootId, AggregateSnapshot>? OnAggregate;
+
+        // -------------------------
+        // Opt-in behavior switches. All default to false so that the engine
+        // behaves exactly as before; enable per deployment as needed.
+        // -------------------------
+
+        // Emit a root only when the updated entity is part of that root's
+        // snapshot (or is the root itself). Prevents re-notifying sibling
+        // aggregates that are merely graph-reachable from the update.
+        public bool EmitOnlyAffectedRoots { get; set; }
+
+        // Keep aggregate boundaries: Assemble/IsComplete do not traverse the
+        // reverse half of bidirectional relations and do not descend into
+        // other root-kind instances. Reciprocal validation still applies.
+        public bool IsolateAggregateBoundaries { get; set; }
+
+        // Skip emission when the snapshot has the same members with the same
+        // object instances as the previous emission for that root.
+        public bool SuppressUnchangedSnapshots { get; set; }
 
         // -------------------------
         // Registration
@@ -180,6 +236,7 @@ namespace TopicManager.Extensions
 
             lr.Reciprocal = rl;
             rl.Reciprocal = lr;
+            rl.IsReciprocalSecondary = true;
 
             AddRelation(lr);
             AddRelation(rl);
@@ -216,7 +273,7 @@ namespace TopicManager.Extensions
         }
 
         // -------------------------
-        // Upsert
+        // Upsert / Remove
         // -------------------------
 
         public void Upsert<T>(KindId kind, T entity) where T : class
@@ -238,8 +295,33 @@ namespace TopicManager.Extensions
             }
 
             // Find impacted roots (reverse + forward traversal)
-            foreach (var root in FindImpactedRoots(new EntityId(kind, key)))
-                EmitIfComplete(root);
+            var changed = new EntityId(kind, key);
+            foreach (var root in FindImpactedRoots(changed))
+                EmitIfComplete(root, changed);
+        }
+
+        // Removes an entity and its outgoing relation edges. Incoming edges
+        // owned by other entities remain until those entities are updated,
+        // mirroring the attribute-driven nature of the indexes. No emission
+        // is triggered by removal.
+        public bool Remove(KindId kind, long key)
+        {
+            if (!_kinds.TryGetValue(kind, out var kd)) return false;
+            if (!kd.Store.TryRemove(key, out _)) return false;
+
+            if (_relsByFrom.TryGetValue(kind, out var relsFrom))
+            {
+                foreach (var rel in relsFrom)
+                    ClearIndexesForFrom(rel, key);
+            }
+
+            if (_rootKinds.ContainsKey(kind))
+            {
+                var rid = new RootId(kind, key);
+                _emitByRoot.TryRemove(rid, out _);
+                _lastEmitted.TryRemove(rid, out _);
+            }
+            return true;
         }
 
         // -------------------------
@@ -312,38 +394,62 @@ namespace TopicManager.Extensions
         private void AddRelation(RelationDef rel)
         {
             _relsByFrom.AddOrUpdate(rel.From,
-                _ => new List<RelationDef> { rel },
-                (_, list) => { lock (list) list.Add(rel); return list; });
+                _ => ImmutableList.Create(rel),
+                (_, list) => list.Add(rel));
 
             _relsByTo.AddOrUpdate(rel.To,
-                _ => new List<RelationDef> { rel },
-                (_, list) => { lock (list) list.Add(rel); return list; });
+                _ => ImmutableList.Create(rel),
+                (_, list) => list.Add(rel));
         }
 
         private void UpdateIndexesForFrom(RelationDef rel, object fromEntity, long fromKey)
         {
-            var keys = rel.GetToKeysFromFrom(fromEntity) ?? Array.Empty<long>();
-            var newTargets = keys.ToImmutableHashSet();
+            var newTargets = (rel.GetToKeysFromFrom(fromEntity) ?? Array.Empty<long>()).ToImmutableHashSet();
 
-            rel.Forward.TryGetValue(fromKey, out var oldTargets);
-            oldTargets ??= ImmutableHashSet<long>.Empty;
-
-            rel.Forward[fromKey] = newTargets;
-
-            foreach (var removed in oldTargets.Except(newTargets))
+            lock (rel.WriteGate)
             {
-                rel.Reverse.AddOrUpdate(
-                    removed,
-                    _ => ImmutableHashSet<long>.Empty,
-                    (_, set) => set.Remove(fromKey));
+                rel.Forward.TryGetValue(fromKey, out var oldTargets);
+                oldTargets ??= ImmutableHashSet<long>.Empty;
+
+                // Periodic republication with unchanged references: no-op.
+                if (newTargets.SetEquals(oldTargets)) return;
+
+                // Add new reverse links before switching Forward, and remove
+                // stale ones after, so concurrent traversals see a superset
+                // of edges (transient over-reach instead of missed roots).
+                foreach (var added in newTargets.Except(oldTargets))
+                {
+                    rel.Reverse.AddOrUpdate(
+                        added,
+                        _ => ImmutableHashSet<long>.Empty.Add(fromKey),
+                        (_, set) => set.Add(fromKey));
+                }
+
+                rel.Forward[fromKey] = newTargets;
+
+                foreach (var removed in oldTargets.Except(newTargets))
+                {
+                    rel.Reverse.AddOrUpdate(
+                        removed,
+                        _ => ImmutableHashSet<long>.Empty,
+                        (_, set) => set.Remove(fromKey));
+                }
             }
+        }
 
-            foreach (var added in newTargets.Except(oldTargets))
+        private void ClearIndexesForFrom(RelationDef rel, long fromKey)
+        {
+            lock (rel.WriteGate)
             {
-                rel.Reverse.AddOrUpdate(
-                    added,
-                    _ => ImmutableHashSet<long>.Empty.Add(fromKey),
-                    (_, set) => set.Add(fromKey));
+                if (!rel.Forward.TryRemove(fromKey, out var oldTargets) || oldTargets == null) return;
+
+                foreach (var removed in oldTargets)
+                {
+                    rel.Reverse.AddOrUpdate(
+                        removed,
+                        _ => ImmutableHashSet<long>.Empty,
+                        (_, set) => set.Remove(fromKey));
+                }
             }
         }
 
@@ -396,10 +502,12 @@ namespace TopicManager.Extensions
             return roots;
         }
 
-        private void EmitIfComplete(RootId root)
+        private void EmitIfComplete(RootId root, EntityId changed)
         {
-            var gate = _gateByRoot.GetOrAdd(root, _ => new object());
-            lock (gate)
+            var state = _emitByRoot.GetOrAdd(root, _ => new RootEmitState());
+            bool drain = false;
+
+            lock (state.Gate)
             {
                 if (!_kinds.TryGetValue(root.Kind, out var rootKindDef)) return;
                 if (!rootKindDef.Store.ContainsKey(root.Key)) return;
@@ -407,18 +515,110 @@ namespace TopicManager.Extensions
                 var snapshot = Assemble(root);
                 if (!IsComplete(root, snapshot)) return;
 
-                // Global event
-                OnAggregate?.Invoke(root, snapshot);
+                if (EmitOnlyAffectedRoots
+                    && !(root.Kind == changed.Kind && root.Key == changed.Key)
+                    && !SnapshotContains(snapshot, changed))
+                    return;
 
-                // Root-kind routing
+                if (SuppressUnchangedSnapshots && !UpdateLastEmitted(root, snapshot))
+                    return;
+
+                Action<RootId, AggregateSnapshot>[] copy = Array.Empty<Action<RootId, AggregateSnapshot>>();
                 if (_rootKindHandlers.TryGetValue(root.Kind, out var handlers))
                 {
-                    Action<RootId, AggregateSnapshot>[] copy;
                     lock (handlers) copy = handlers.ToArray();
-                    foreach (var h in copy) h(root, snapshot);
+                }
+
+                state.Pending.Enqueue(new PendingEmit(snapshot, OnAggregate, copy));
+
+                if (!state.Draining)
+                {
+                    state.Draining = true;
+                    drain = true;
+                }
+            }
+
+            if (!drain) return;
+
+            // Drain FIFO outside the gate so subscriber callbacks never run
+            // while the gate is held. Re-entrant upserts from a callback are
+            // enqueued above and picked up by this loop.
+            while (true)
+            {
+                PendingEmit item;
+                lock (state.Gate)
+                {
+                    if (state.Pending.Count == 0)
+                    {
+                        state.Draining = false;
+                        return;
+                    }
+                    item = state.Pending.Dequeue();
+                }
+
+                try
+                {
+                    item.Global?.Invoke(root, item.Snapshot);
+                    foreach (var h in item.Handlers) h(root, item.Snapshot);
+                }
+                catch
+                {
+                    // Release the drain flag so a later emit can resume the
+                    // queue; the failing exception still reaches the caller.
+                    lock (state.Gate) state.Draining = false;
+                    throw;
                 }
             }
         }
+
+        private bool SnapshotContains(AggregateSnapshot snapshot, EntityId id)
+        {
+            if (!_kinds.TryGetValue(id.Kind, out var kd)) return false;
+            if (!snapshot.Raw.TryGetValue(id.Kind, out var list)) return false;
+            foreach (var obj in list)
+            {
+                if (kd.GetKey(obj) == id.Key) return true;
+            }
+            return false;
+        }
+
+        // Returns false when the snapshot is member-and-reference identical
+        // to the previous emission for this root. Called under the root gate.
+        private bool UpdateLastEmitted(RootId root, AggregateSnapshot snapshot)
+        {
+            var sig = new Dictionary<EntityId, object>();
+            foreach (var (kind, list) in snapshot.Raw)
+            {
+                if (!_kinds.TryGetValue(kind, out var kd)) continue;
+                foreach (var obj in list)
+                    sig[new EntityId(kind, kd.GetKey(obj))] = obj;
+            }
+
+            if (_lastEmitted.TryGetValue(root, out var prev) && prev.Count == sig.Count)
+            {
+                var same = true;
+                foreach (var kv in sig)
+                {
+                    if (!prev.TryGetValue(kv.Key, out var p) || !ReferenceEquals(p, kv.Value))
+                    {
+                        same = false;
+                        break;
+                    }
+                }
+                if (same) return false;
+            }
+
+            _lastEmitted[root] = sig;
+            return true;
+        }
+
+        private bool SkipTraversal(RelationDef rel) =>
+            IsolateAggregateBoundaries && rel.IsReciprocalSecondary;
+
+        private bool IsForeignRoot(RootId root, EntityId cur) =>
+            IsolateAggregateBoundaries
+            && _rootKinds.ContainsKey(cur.Kind)
+            && !(cur.Kind == root.Kind && cur.Key == root.Key);
 
         // Assemble from root following Forward edges only.
         private AggregateSnapshot Assemble(RootId root)
@@ -449,10 +649,14 @@ namespace TopicManager.Extensions
 
                 TryAdd(cur);
 
+                // Boundary isolation: reference other roots shallowly.
+                if (IsForeignRoot(root, cur)) continue;
+
                 if (_relsByFrom.TryGetValue(cur.Kind, out var outgoing))
                 {
                     foreach (var rel in outgoing)
                     {
+                        if (SkipTraversal(rel)) continue;
                         if (rel.Forward.TryGetValue(cur.Key, out var toKeys))
                         {
                             toKeys ??= ImmutableHashSet<long>.Empty;
@@ -508,10 +712,15 @@ namespace TopicManager.Extensions
                 var cur = q.Dequeue();
                 if (!visited.Add(cur)) continue;
 
+                // Boundary isolation: do not impose another root's obligations.
+                if (IsForeignRoot(root, cur)) continue;
+
                 if (!_relsByFrom.TryGetValue(cur.Kind, out var outgoing)) continue;
 
                 foreach (var rel in outgoing)
                 {
+                    if (SkipTraversal(rel)) continue;
+
                     if (!rel.Forward.TryGetValue(cur.Key, out var toKeys))
                         toKeys = ImmutableHashSet<long>.Empty;
                     toKeys ??= ImmutableHashSet<long>.Empty;
