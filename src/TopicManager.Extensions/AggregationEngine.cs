@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Linq;
+using System.Reflection;
 using System.Threading;
 
 namespace TopicManager.Extensions
@@ -270,6 +271,130 @@ namespace TopicManager.Extensions
             {
                 if (Interlocked.Exchange(ref _done, 1) == 0) _dispose();
             }
+        }
+
+        // -------------------------
+        // Typed aggregate binding: lets a subscriber declare the shape of
+        // the snapshot it wants (a POCO) instead of calling TryGetMany/
+        // TryGetOne per kind. Member types are matched against registered
+        // Kinds via reflection, cached per POCO type.
+        // -------------------------
+
+        private enum MemberShape { None, Single, List, Array }
+
+        private sealed class AggregateMember
+        {
+            public Type ElementType = null!;
+            public MemberShape Shape;
+            public Action<object, object?> Set = null!;
+        }
+
+        private sealed class AggregateBinder
+        {
+            public AggregateMember[] Members = Array.Empty<AggregateMember>();
+        }
+
+        private static readonly ConcurrentDictionary<Type, AggregateBinder> _binders = new();
+
+        private static MemberShape DescribeMember(Type memberType, out Type elementType)
+        {
+            if (memberType.IsArray)
+            {
+                elementType = memberType.GetElementType()!;
+                return elementType.IsClass ? MemberShape.Array : MemberShape.None;
+            }
+
+            if (memberType.IsGenericType)
+            {
+                var def = memberType.GetGenericTypeDefinition();
+                if (def == typeof(List<>) || def == typeof(IList<>) || def == typeof(IReadOnlyList<>)
+                    || def == typeof(ICollection<>) || def == typeof(IEnumerable<>))
+                {
+                    elementType = memberType.GetGenericArguments()[0];
+                    return elementType.IsClass ? MemberShape.List : MemberShape.None;
+                }
+            }
+
+            if (memberType.IsClass && memberType != typeof(string))
+            {
+                elementType = memberType;
+                return MemberShape.Single;
+            }
+
+            elementType = memberType;
+            return MemberShape.None;
+        }
+
+        private static AggregateBinder GetBinder(Type aggregateType) => _binders.GetOrAdd(aggregateType, t =>
+        {
+            var members = new List<AggregateMember>();
+
+            foreach (var prop in t.GetProperties(BindingFlags.Public | BindingFlags.Instance))
+            {
+                if (!prop.CanWrite || prop.GetIndexParameters().Length > 0) continue;
+                var shape = DescribeMember(prop.PropertyType, out var elementType);
+                if (shape == MemberShape.None) continue;
+                var p = prop;
+                members.Add(new AggregateMember { ElementType = elementType, Shape = shape, Set = (obj, val) => p.SetValue(obj, val) });
+            }
+
+            foreach (var field in t.GetFields(BindingFlags.Public | BindingFlags.Instance))
+            {
+                if (field.IsInitOnly) continue;
+                var shape = DescribeMember(field.FieldType, out var elementType);
+                if (shape == MemberShape.None) continue;
+                var f = field;
+                members.Add(new AggregateMember { ElementType = elementType, Shape = shape, Set = (obj, val) => f.SetValue(obj, val) });
+            }
+
+            return new AggregateBinder { Members = members.ToArray() };
+        });
+
+        private TAggregate BindAggregate<TAggregate>(AggregateSnapshot snapshot) where TAggregate : class, new()
+        {
+            var binder = GetBinder(typeof(TAggregate));
+            var instance = new TAggregate();
+
+            foreach (var member in binder.Members)
+            {
+                // Members whose type was never registered via RegisterKind
+                // are left at their default value (e.g. plain metadata
+                // fields the caller added to the POCO).
+                if (!_typeToKind.TryGetValue(member.ElementType, out var kind)) continue;
+                snapshot.Raw.TryGetValue(kind, out var list);
+
+                switch (member.Shape)
+                {
+                    case MemberShape.Single:
+                        member.Set(instance, list is { Count: > 0 } ? list[0] : null);
+                        break;
+                    case MemberShape.Array:
+                    case MemberShape.List:
+                    {
+                        var count = list?.Count ?? 0;
+                        var array = Array.CreateInstance(member.ElementType, count);
+                        for (int i = 0; i < count; i++) array.SetValue(list![i], i);
+                        member.Set(instance, member.Shape == MemberShape.Array
+                            ? array
+                            : Activator.CreateInstance(typeof(List<>).MakeGenericType(member.ElementType), (object)array));
+                        break;
+                    }
+                }
+            }
+
+            return instance;
+        }
+
+        // Same as SubscribeRootKind(KindId, Action<RootId, AggregateSnapshot>),
+        // but delivers a caller-defined POCO instead of a raw snapshot. Each
+        // public settable field/property of TAggregate whose type (or element
+        // type, for arrays/List<T>/IReadOnlyList<T>/...) matches a registered
+        // Kind is populated automatically; unmatched members are left as-is.
+        public IDisposable SubscribeRootKind<TAggregate>(KindId rootKind, Action<RootId, TAggregate> handler)
+            where TAggregate : class, new()
+        {
+            if (handler == null) throw new ArgumentNullException(nameof(handler));
+            return SubscribeRootKind(rootKind, (root, snapshot) => handler(root, BindAggregate<TAggregate>(snapshot)));
         }
 
         // -------------------------
