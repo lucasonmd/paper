@@ -36,7 +36,6 @@ namespace AggregationEngine.ModuleDesigner.Core
 
                     raw.Add(new CandidateRelation
                     {
-                        Name = $"{topic.ClassName}->{field.FieldName}",
                         FromClass = topic.ClassName,
                         FromField = field.FieldName,
                         ToClass = confidence >= UnresolvedThreshold ? bestTopic?.ClassName : null,

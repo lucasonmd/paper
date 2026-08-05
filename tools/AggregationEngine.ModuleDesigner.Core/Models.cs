@@ -39,7 +39,14 @@ namespace AggregationEngine.ModuleDesigner.Core
     // alone (target Kind, multiplicity, direction, presence convention).
     public sealed class CandidateRelation
     {
-        public string Name { get; set; } = "";
+        // "<from class>-<to class>". Computed rather than stored so it can
+        // never go stale after the user re-points ToClass in the review UI.
+        // The engine never reads relation names (they only surface in
+        // JsonModuleLoader's error messages and when a human reads the
+        // generated file), so uniqueness is not required - two relations
+        // between the same pair of classes legitimately share a name.
+        public string Name => $"{FromClass}-{ToClass ?? "?"}";
+
         public string FromClass { get; set; } = "";
         public string FromField { get; set; } = "";
         public string? ToClass { get; set; }         // null = unresolved, user must pick

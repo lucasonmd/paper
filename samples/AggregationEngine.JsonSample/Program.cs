@@ -118,6 +118,10 @@ namespace AggregationEngine.JsonSample
             Check(lastLin != null && !lastLin.TryGetOne<C_Linear_Target_Position>(linTargetKind, out _), "NIL TargetPosition correctly absent (Linear side)");
             Check(rotEmits >= 1, "sharing C_Actual_Mount across both aggregates did not disturb the already-completed RotationalMount");
 
+            // Proves the JSON path is behaviourally interchangeable with
+            // hand-written registration, not merely that it runs.
+            _failures += CodeVsJsonEquivalence.Run(jsonPath);
+
             Console.WriteLine();
             if (_failures == 0)
             {
