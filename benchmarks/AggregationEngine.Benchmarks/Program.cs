@@ -40,6 +40,9 @@ namespace AggregationEngine.Benchmarks
             RunExperiment4();
 
             Console.WriteLine();
+            ThroughputAndResolution.Run(ResultsDir);
+
+            Console.WriteLine();
             Console.WriteLine("All results written under: " + Path.GetFullPath(ResultsDir));
         }
 

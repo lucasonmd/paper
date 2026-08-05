@@ -3,9 +3,38 @@
 Measured on: local dev machine, .NET 8, `dotnet run -c Release`,
 `benchmarks/AggregationEngine.Benchmarks`. All numbers below are from an
 actual run of the committed benchmark code (`Program.cs`); raw CSVs are in
-`results/`. Two consecutive runs of Experiments 2–3 agreed within ~10%,
-consistent with ordinary JIT/GC microbenchmark noise on a shared machine —
-treat absolute numbers as indicative of scale, not a controlled lab result.
+`results/`.
+
+## Reproducibility — read this before quoting any timing number
+
+The suite was re-run repeatedly after the numbers below were first recorded.
+Findings:
+
+- **EXP1 and EXP4 are deterministic** and reproduced byte-for-byte every
+  time. These are the results to lean on.
+- **EXP2 and EXP3 p50 reproduce within ~10%** — *provided the machine is
+  thermally settled*. Re-measured EXP2 engine(default) at V=800 across five
+  cooled runs: 606 / 631 / 619 / 614 / 642 µs against the 595 µs recorded
+  below. EXP3 engine(default) p50: 10.1 / 9.7 / 9.6 / 9.4 / 9.8 µs against
+  9.1 µs below.
+- **Back-to-back runs without a cooldown inflate everything ~2×.** Five
+  consecutive runs with no pause produced EXP2 V=800 figures of 1203 / 1001 /
+  607 / 896 / 1012 µs and EXP3 p50 of 22.0 / 21.6 / 10.0 / 23.3 / 23.5 µs.
+  A ~25 s pause between runs was enough to return to the settled values;
+  20 s was not. This is CPU thermal/boost behaviour on a laptop-class
+  machine, not a property of the code — but it means *any* timing number
+  here is meaningless without stating that runs were spaced out.
+- **EXP3 p95 does not reproduce and should not be quoted.** Observed values
+  for engine(default) p95 span 11.4–23.7 µs across runs whose p50 was stable
+  at ~10 µs. The tail is dominated by GC pauses and OS scheduling, i.e. it
+  measures the machine, not the engine.
+- **The EXP3 *ratio* against legacy is not a sound figure either.** EXP5
+  (below) shows the legacy p50 of 0.100 µs is exactly one `Stopwatch` tick —
+  the baseline sits on the timer's resolution floor, so the true legacy
+  latency is somewhere in (0, 0.1] µs and unresolvable. Any "engine is N×
+  slower" derived from EXP3 is therefore a *lower bound*, not a measurement.
+  The EXP2 ratio does not have this problem: at V=800 both sides (4.5 µs =
+  45 ticks, 595 µs = 5950 ticks) are far above the floor.
 
 Scenario: the NGVA `C_Rotational_Mount` aggregate from the paper (Mount +
 ActualMount base + Specification + SoftLimits + 0..* InhibitZone + 0..1
@@ -75,14 +104,19 @@ call.
 
 | Config | p50 (µs) | p95 (µs) |
 |---|---:|---:|
-| Legacy | 0.10 | 0.50 |
-| Engine (default) | 9.10–9.20 | 13.10–13.20 |
-| Engine (all 3 flags) | 9.30–9.80 | 12.50–13.60 |
+| Legacy | 0.10 *(= 1 timer tick — at the resolution floor, see EXP5)* | 0.50 *(5 ticks)* |
+| Engine (default) | 9.1–10.1 | *not reproducible — do not quote* |
+| Engine (all 3 flags) | 8.9–11.3 | *not reproducible — do not quote* |
 
-**Reading.** ~90× median latency overhead versus the hand-written baseline
-at this aggregate size. The hardening flags do not change this figure
-materially — they change *how many times* subscribers are called, not the
-per-call assembly cost.
+**Reading.** The engine spends roughly **10 µs** completing one aggregate of
+this size; the hand-written baseline completes it in *under one timer tick*,
+so the harness cannot say how fast it actually is. The honest statement is
+therefore an absolute one — "≈10 µs per completed aggregate" — plus the
+observation that the baseline is at least two orders of magnitude cheaper.
+Quoting a precise multiple from this experiment would be reading precision
+into an unresolvable denominator; use EXP2's V=800 figures if a ratio is
+needed. The hardening flags do not change per-call cost materially — they
+change *how many times* subscribers are called, not the assembly cost.
 
 ## Experiment 4 — order-independence (correctness, engine only)
 
@@ -159,6 +193,41 @@ addition is a single declarative statement that cannot, by construction,
 leave `TryComplete`-equivalent logic out of sync, because there is no
 per-kind `TryComplete` to forget.
 
+## Experiment 6 — timer resolution (is the EXP3 baseline measurable at all?)
+
+Added after noticing EXP3's legacy row came out at exactly 0.100 / 0.500 µs
+on every single run.
+
+```
+Stopwatch.Frequency        : 10,000,000 Hz
+one tick                   : 0.1000 µs
+Stopwatch.IsHighResolution : True
+EXP3 legacy p50 (0.100 µs) : 1.00 tick
+EXP3 legacy p95 (0.500 µs) : 5.00 ticks
+EXP3 engine p50 (~10 µs)   : 100 ticks
+empty Restart/Stop pair    : p50 0.0000 µs, p95 0.1000 µs
+```
+
+**Reading.** Confirmed: the legacy baseline in EXP3 is one timer tick. The
+harness physically cannot distinguish 0.1 µs from 0.01 µs, so the legacy
+figure is an upper bound and any EXP3-derived "N× slower" is a *lower*
+bound on the real multiple — it understates the gap rather than
+flattering it. EXP2 is unaffected (both sides are tens to thousands of
+ticks there).
+
+## Experiment 7 — sustained throughput (attempted, not usable)
+
+Intended to give a more meaningful figure than a ratio between two
+sub-millisecond numbers: completed aggregates per second, measured as a
+sustained loop rather than inferred from latency.
+
+**It did not produce a quotable number.** Engine (default), consecutive
+runs: 13,620 / 17,921 / 30,765 / 16,488 aggregates/sec — a 2.3× spread,
+trending upward within a session, which points at JIT tiering, CPU boost
+state, and a growing store rather than a settled steady state. Kept in the
+repo because the harness is reusable and the instability is itself worth
+recording, but **do not cite these numbers**.
+
 ## Honest limitations of this benchmark
 
 - Single machine, in-process, synthetic topic stream — no DDS transport,
@@ -168,6 +237,13 @@ per-kind `TryComplete` to forget.
   hand-written reverse index for the shared Specification, matching what a
   competent implementation would do), not a strawman with the reverse index
   omitted.
+- **Timing runs must be spaced out.** See the reproducibility section at the
+  top: back-to-back runs inflate every timing figure by ~2× on this machine.
+  All timing numbers quoted here are from thermally settled runs.
 - Experiment 2/3 absolute microsecond figures depend on machine/JIT state;
   the paper should report them as *this measurement*, not as a
   universal constant, and disclose the methodology above.
+- Of the seven experiments, only **1, 4, and 5** are fully deterministic
+  (notification counts, permutation coverage, static line counts). 2 and 3
+  (p50) are reproducible within ~10% under the stated conditions. 3 (p95)
+  and 7 are not reproducible and are excluded from any claim.
