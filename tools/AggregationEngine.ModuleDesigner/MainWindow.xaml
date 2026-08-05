@@ -86,7 +86,7 @@
                         <DataGridTemplateColumn Header="Reciprocal field" Width="150">
                             <DataGridTemplateColumn.CellTemplate>
                                 <DataTemplate>
-                                    <ComboBox ItemsSource="{Binding AvailableClassNames}"
+                                    <ComboBox ItemsSource="{Binding ReciprocalFieldOptions}"
                                               SelectedItem="{Binding ReciprocalField, UpdateSourceTrigger=PropertyChanged}"
                                               IsEditable="True" Visibility="{Binding ShowReciprocalFields, Converter={StaticResource BoolToVis}}"/>
                                 </DataTemplate>

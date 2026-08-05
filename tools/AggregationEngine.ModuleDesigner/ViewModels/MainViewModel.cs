@@ -72,9 +72,17 @@ namespace AggregationEngine.ModuleDesigner.ViewModels
                     AvailableClassNames.Add(t.ClassName);
                 }
 
+                // class name -> its own candidate relation fields (e.g.
+                // "C_Rotational_Soft_Limits" -> ["A_rotationalMount_sourceID"]),
+                // so the Reciprocal field picker in the grid offers actual
+                // fields of the chosen target class, not class names.
+                IReadOnlyDictionary<string, IReadOnlyList<string>> fieldsByClass = detected.ToDictionary(
+                    t => t.ClassName,
+                    t => (IReadOnlyList<string>)t.CandidateFields.Select(f => f.FieldName).ToList());
+
                 Relations.Clear();
                 foreach (var r in inferred)
-                    Relations.Add(new RelationRow(r, AvailableClassNames));
+                    Relations.Add(new RelationRow(r, AvailableClassNames, fieldsByClass));
 
                 var unresolved = Relations.Count(r => r.ToClass == null);
                 var lowConfidence = Relations.Count(r => r.Confidence < 0.8);

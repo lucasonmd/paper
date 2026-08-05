@@ -1,3 +1,5 @@
+using System;
+using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using AggregationEngine.ModuleDesigner.Core;
 using AggregationEngine.ModuleDesigner.Mvvm;
@@ -19,9 +21,15 @@ namespace AggregationEngine.ModuleDesigner.ViewModels
     {
         public CandidateRelation Model { get; }
 
-        // Shared with the parent view model so the "target class" and
-        // "reciprocal field" pickers always reflect the current Topic list.
+        // Shared with the parent view model so the "target class" picker
+        // always reflects the current Topic list.
         public ObservableCollection<string> AvailableClassNames { get; }
+
+        // class name -> its candidate relation field names (the same
+        // A_..._sourceID members CsFileAnalyzer found on it). Used to
+        // populate ReciprocalFieldOptions for whichever class is currently
+        // selected as ToClass.
+        private readonly IReadOnlyDictionary<string, IReadOnlyList<string>> _fieldsByClass;
 
         public string FromClass => Model.FromClass;
         public string FromField => Model.FromField;
@@ -31,8 +39,30 @@ namespace AggregationEngine.ModuleDesigner.ViewModels
         public string? ToClass
         {
             get => _toClass;
-            set { if (Set(ref _toClass, value)) Model.ToClass = value; }
+            set
+            {
+                if (Set(ref _toClass, value))
+                {
+                    Model.ToClass = value;
+                    OnPropertyChanged(nameof(ReciprocalFieldOptions));
+                    // A reciprocal field chosen for the old target rarely
+                    // makes sense on a different one - clear it instead of
+                    // silently keeping a value that isn't actually a field
+                    // on the new ToClass.
+                    if (ReciprocalField != null && !ReciprocalFieldOptions.Contains(ReciprocalField))
+                        ReciprocalField = null;
+                }
+            }
         }
+
+        // The candidate relation fields declared on the currently selected
+        // ToClass - e.g. once ToClass = "C_Rotational_Soft_Limits", this
+        // lists that class's own A_..._sourceID fields (such as
+        // A_rotationalMount_sourceID), not class names.
+        public IReadOnlyList<string> ReciprocalFieldOptions =>
+            _toClass != null && _fieldsByClass.TryGetValue(_toClass, out var fields)
+                ? fields
+                : Array.Empty<string>();
 
         private bool _bidirectional;
         public bool Bidirectional
@@ -96,10 +126,12 @@ namespace AggregationEngine.ModuleDesigner.ViewModels
         public bool ShowReciprocalFields => Bidirectional;
         public bool ShowPresenceCheck => Multiplicity == "ZeroOrOne" || (Bidirectional && ReciprocalMultiplicity == "ZeroOrOne");
 
-        public RelationRow(CandidateRelation model, ObservableCollection<string> availableClassNames)
+        public RelationRow(CandidateRelation model, ObservableCollection<string> availableClassNames,
+            IReadOnlyDictionary<string, IReadOnlyList<string>> fieldsByClass)
         {
             Model = model;
             AvailableClassNames = availableClassNames;
+            _fieldsByClass = fieldsByClass;
             _toClass = model.ToClass;
             _bidirectional = model.Bidirectional;
             _reciprocalField = model.ReciprocalField;
