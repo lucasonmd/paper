@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Linq;
+using System.Linq.Expressions;
 using System.Reflection;
 using System.Threading;
 
@@ -14,6 +15,17 @@ namespace TopicManager.Extensions
         ZeroOrOne,  // 0..1
         OneOrMany,  // 1..*
         ZeroOrMany  // 0..*
+    }
+
+    // How a reflection-built accessor decides a ZeroOrOne/optional reference
+    // is absent. Nullable checks Nullable<T>.HasValue; NilIdentifier treats a
+    // composite identifier whose sub-fields are all zero as absent (matches
+    // NGVA's convention of filling unset references with A_resourceId=0,
+    // A_instanceId=0 rather than leaving the field null).
+    public enum PresenceCheck
+    {
+        Nullable,
+        NilIdentifier,
     }
 
     public readonly record struct KindId(int Value);
@@ -179,6 +191,31 @@ namespace TopicManager.Extensions
             return kind;
         }
 
+        // Reflection-based counterpart to RegisterKind<T>, for JSON/schema-
+        // driven registration (a generator or config loader supplies the
+        // CLR type and key field/property name at startup instead of a
+        // hand-written lambda). Internally builds the exact same shape of
+        // Func<object,long> the generic overload builds, so KindDef and
+        // everything downstream is unaffected - this is purely an
+        // alternate way to construct that delegate. The reflection/
+        // Expression-tree cost is paid once here, at registration time,
+        // not per Upsert.
+        public KindId RegisterKind(Type clrType, string keyFieldName, Func<long, long, long>? combineIdentifier = null)
+        {
+            if (clrType == null) throw new ArgumentNullException(nameof(clrType));
+            if (string.IsNullOrEmpty(keyFieldName)) throw new ArgumentNullException(nameof(keyFieldName));
+
+            var combine = combineIdentifier ?? DefaultCombineIdentifier;
+            var member = ResolveMember(clrType, keyFieldName)
+                ?? throw new InvalidOperationException($"Key field/property '{keyFieldName}' not found on {clrType.FullName}");
+            var getter = CompileGetter(clrType, member);
+            var toLong = BuildElementConverter(MemberReturnType(member), combine);
+
+            var kind = _typeToKind.GetOrAdd(clrType, _ => new KindId(Interlocked.Increment(ref _nextKind)));
+            _kinds.TryAdd(kind, new KindDef(kind, clrType, obj => toLong(getter(obj))));
+            return kind;
+        }
+
         public void RegisterRootKind(KindId kind) => _rootKinds[kind] = true;
 
         public void RegisterUnidirectional<TFrom, TTo>(
@@ -202,6 +239,31 @@ namespace TopicManager.Extensions
                 o => getToKeysFromFrom((TFrom)o) ?? Array.Empty<long>());
 
             AddRelation(rel);
+        }
+
+        // Reflection-based counterpart to RegisterUnidirectional<TFrom,TTo>.
+        // fromFieldName names the field/property on fromClrType carrying the
+        // foreign key(s): a scalar or composite-identifier member for
+        // One/ZeroOrOne, or an enumerable of either for OneOrMany/ZeroOrMany.
+        // presenceCheck only matters for ZeroOrOne.
+        public void RegisterUnidirectional(
+            string name,
+            KindId fromKind,
+            KindId toKind,
+            Multiplicity multiplicity,
+            Type fromClrType,
+            string fromFieldName,
+            PresenceCheck presenceCheck = PresenceCheck.Nullable,
+            Func<long, long, long>? combineIdentifier = null)
+        {
+            EnsureKindRegistered(fromKind, nameof(fromKind));
+            EnsureKindRegistered(toKind, nameof(toKind));
+
+            var accessor = BuildRelationAccessor(
+                fromClrType, fromFieldName, multiplicity, presenceCheck,
+                combineIdentifier ?? DefaultCombineIdentifier);
+
+            AddRelation(new RelationDef(name, fromKind, toKind, multiplicity, accessor));
         }
 
         // Bidirectional with reciprocal validation enabled
@@ -234,6 +296,42 @@ namespace TopicManager.Extensions
                 leftKind,
                 rightToLeftMultiplicity,
                 o => getLeftKeysFromRight((TRight)o) ?? Array.Empty<long>());
+
+            lr.Reciprocal = rl;
+            rl.Reciprocal = lr;
+            rl.IsReciprocalSecondary = true;
+
+            AddRelation(lr);
+            AddRelation(rl);
+        }
+
+        // Reflection-based counterpart to RegisterBidirectional<TLeft,TRight>.
+        // Same field-naming contract as the non-generic RegisterUnidirectional
+        // on each side; reciprocal validation is wired up exactly as in the
+        // generic overload.
+        public void RegisterBidirectional(
+            string name,
+            KindId leftKind,
+            KindId rightKind,
+            Multiplicity leftToRightMultiplicity,
+            Multiplicity rightToLeftMultiplicity,
+            Type leftClrType,
+            string leftFieldName,
+            Type rightClrType,
+            string rightFieldName,
+            PresenceCheck leftPresenceCheck = PresenceCheck.Nullable,
+            PresenceCheck rightPresenceCheck = PresenceCheck.Nullable,
+            Func<long, long, long>? combineIdentifier = null)
+        {
+            EnsureKindRegistered(leftKind, nameof(leftKind));
+            EnsureKindRegistered(rightKind, nameof(rightKind));
+
+            var combine = combineIdentifier ?? DefaultCombineIdentifier;
+            var leftAccessor = BuildRelationAccessor(leftClrType, leftFieldName, leftToRightMultiplicity, leftPresenceCheck, combine);
+            var rightAccessor = BuildRelationAccessor(rightClrType, rightFieldName, rightToLeftMultiplicity, rightPresenceCheck, combine);
+
+            var lr = new RelationDef(name + ":L->R", leftKind, rightKind, leftToRightMultiplicity, leftAccessor);
+            var rl = new RelationDef(name + ":R->L", rightKind, leftKind, rightToLeftMultiplicity, rightAccessor);
 
             lr.Reciprocal = rl;
             rl.Reciprocal = lr;
@@ -514,6 +612,179 @@ namespace TopicManager.Extensions
         {
             if (!_kinds.ContainsKey(kind))
                 throw new InvalidOperationException($"Unregistered kind used: {argName}={kind}");
+        }
+
+        // -------------------------
+        // Reflection-based registration internals (used by the non-generic
+        // RegisterKind/RegisterUnidirectional/RegisterBidirectional
+        // overloads). All reflection and Expression-tree compilation here
+        // runs once per Register* call, at startup - never per Upsert.
+        // -------------------------
+
+        // Default composite-identifier combiner, matching the sub-field
+        // names NGVA's own data model uses (A_sourceID.A_resourceId /
+        // A_sourceID.A_instanceId). Callers with a different combination
+        // rule pass their own via the combineIdentifier parameter.
+        public static long DefaultCombineIdentifier(long resourceId, long instanceId) =>
+            (resourceId << 32) | (instanceId & 0xFFFFFFFFL);
+
+        private static readonly Type[] IntegerLikeTypes =
+        {
+            typeof(long), typeof(ulong), typeof(int), typeof(uint),
+            typeof(short), typeof(ushort), typeof(byte), typeof(sbyte),
+        };
+
+        private static bool IsIntegerLike(Type t) => Array.IndexOf(IntegerLikeTypes, t) >= 0;
+
+        private static MemberInfo ResolveMember(Type ownerType, string name)
+        {
+            var prop = ownerType.GetProperty(name, BindingFlags.Public | BindingFlags.Instance);
+            if (prop != null) return prop;
+            var field = ownerType.GetField(name, BindingFlags.Public | BindingFlags.Instance);
+            if (field != null) return field;
+            throw new InvalidOperationException($"Field/property '{name}' not found on {ownerType.FullName}");
+        }
+
+        private static Type MemberReturnType(MemberInfo member) => member switch
+        {
+            PropertyInfo p => p.PropertyType,
+            FieldInfo f => f.FieldType,
+            _ => throw new InvalidOperationException("member must be a field or property"),
+        };
+
+        // Compiles a cached Func<object,object?> for one field/property
+        // access, boxing value types. Reflection cost (GetProperty/GetField)
+        // and Expression compilation both happen once, here.
+        private static Func<object, object?> CompileGetter(Type ownerType, MemberInfo member)
+        {
+            var param = Expression.Parameter(typeof(object), "obj");
+            var castParam = Expression.Convert(param, ownerType);
+            Expression access = member switch
+            {
+                PropertyInfo p => Expression.Property(castParam, p),
+                FieldInfo f => Expression.Field(castParam, f),
+                _ => throw new InvalidOperationException("member must be a field or property"),
+            };
+            var boxed = Expression.Convert(access, typeof(object));
+            return Expression.Lambda<Func<object, object?>>(boxed, param).Compile();
+        }
+
+        private static Type? GetEnumerableElementType(Type t)
+        {
+            if (t.IsArray) return t.GetElementType();
+            if (t.IsGenericType)
+            {
+                var def = t.GetGenericTypeDefinition();
+                if (def == typeof(List<>) || def == typeof(IList<>) || def == typeof(IReadOnlyList<>)
+                    || def == typeof(ICollection<>) || def == typeof(IEnumerable<>))
+                    return t.GetGenericArguments()[0];
+            }
+            foreach (var iface in t.GetInterfaces())
+            {
+                if (iface.IsGenericType && iface.GetGenericTypeDefinition() == typeof(IEnumerable<>))
+                    return iface.GetGenericArguments()[0];
+            }
+            return null;
+        }
+
+        // Builds a converter from one element's raw value (an integer-like
+        // boxed value, or a composite identifier instance) to a long key.
+        private static Func<object?, long> BuildElementConverter(Type elementType, Func<long, long, long> combine)
+        {
+            var underlying = Nullable.GetUnderlyingType(elementType) ?? elementType;
+
+            if (IsIntegerLike(underlying))
+                return raw => raw == null ? 0L : Convert.ToInt64(raw);
+
+            var resMember = ResolveMember(underlying, "A_resourceId");
+            var instMember = ResolveMember(underlying, "A_instanceId");
+            var resGetter = CompileGetter(underlying, resMember);
+            var instGetter = CompileGetter(underlying, instMember);
+
+            return raw =>
+            {
+                if (raw == null) return 0L;
+                long r = Convert.ToInt64(resGetter(raw));
+                long i = Convert.ToInt64(instGetter(raw));
+                return combine(r, i);
+            };
+        }
+
+        // True when a composite identifier's sub-fields are both zero (the
+        // NGVA convention for "no reference"), or the raw value is null.
+        // Returns false for identifier types with no A_resourceId/
+        // A_instanceId pair - those can never be "NIL" under this check.
+        private static bool IsNilIdentifierValue(object? raw, Type memberType)
+        {
+            if (raw == null) return true;
+            var resProp = memberType.GetProperty("A_resourceId", BindingFlags.Public | BindingFlags.Instance);
+            var resField = resProp == null ? memberType.GetField("A_resourceId", BindingFlags.Public | BindingFlags.Instance) : null;
+            var instProp = memberType.GetProperty("A_instanceId", BindingFlags.Public | BindingFlags.Instance);
+            var instField = instProp == null ? memberType.GetField("A_instanceId", BindingFlags.Public | BindingFlags.Instance) : null;
+            if (resProp == null && resField == null) return false;
+            if (instProp == null && instField == null) return false;
+
+            object? resVal = resProp != null ? resProp.GetValue(raw) : resField!.GetValue(raw);
+            object? instVal = instProp != null ? instProp.GetValue(raw) : instField!.GetValue(raw);
+            return Convert.ToInt64(resVal) == 0 && Convert.ToInt64(instVal) == 0;
+        }
+
+        // Builds the Func<object,IEnumerable<long>> a RelationDef needs,
+        // covering all four multiplicities and both presence conventions,
+        // from a single (owner type, field name) pair.
+        private static Func<object, IEnumerable<long>> BuildRelationAccessor(
+            Type ownerType, string fieldName, Multiplicity multiplicity,
+            PresenceCheck presenceCheck, Func<long, long, long> combine)
+        {
+            var member = ResolveMember(ownerType, fieldName);
+            var memberType = MemberReturnType(member);
+            var getter = CompileGetter(ownerType, member);
+
+            bool isMany = multiplicity is Multiplicity.OneOrMany or Multiplicity.ZeroOrMany;
+
+            if (isMany)
+            {
+                var elementType = GetEnumerableElementType(memberType)
+                    ?? throw new InvalidOperationException(
+                        $"'{ownerType.FullName}.{fieldName}' is not enumerable but multiplicity is {multiplicity}");
+                var elementToLong = BuildElementConverter(elementType, combine);
+
+                return obj =>
+                {
+                    var raw = getter(obj);
+                    if (raw is not System.Collections.IEnumerable seq) return Array.Empty<long>();
+                    var list = new List<long>();
+                    foreach (var item in seq) list.Add(elementToLong(item));
+                    return list;
+                };
+            }
+
+            var scalarToLong = BuildElementConverter(memberType, combine);
+
+            if (multiplicity == Multiplicity.One)
+                return obj => AggregationEngine.One(scalarToLong(getter(obj)));
+
+            // ZeroOrOne
+            if (presenceCheck == PresenceCheck.NilIdentifier)
+            {
+                return obj =>
+                {
+                    var raw = getter(obj);
+                    bool present = !IsNilIdentifierValue(raw, memberType);
+                    return AggregationEngine.ZeroOrOne(present, present ? scalarToLong(raw) : 0L);
+                };
+            }
+
+            // Nullable convention (default). Boxing a Nullable<T> yields a
+            // real null when HasValue is false and a boxed T when true, so
+            // getter(obj) already collapses to a plain null/non-null check -
+            // no further reflection needed per call.
+            return obj =>
+            {
+                var raw = getter(obj);
+                bool present = raw != null;
+                return AggregationEngine.ZeroOrOne(present, present ? scalarToLong(raw) : 0L);
+            };
         }
 
         private void AddRelation(RelationDef rel)
