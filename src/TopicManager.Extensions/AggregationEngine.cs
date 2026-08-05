@@ -204,10 +204,12 @@ namespace TopicManager.Extensions
         {
             if (clrType == null) throw new ArgumentNullException(nameof(clrType));
             if (string.IsNullOrEmpty(keyFieldName)) throw new ArgumentNullException(nameof(keyFieldName));
+            if (!clrType.IsClass)
+                throw new ArgumentException($"'{clrType.FullName}' must be a reference type (class) - matches the RegisterKind<T> where T : class constraint on the generic overload.", nameof(clrType));
 
             var combine = combineIdentifier ?? DefaultCombineIdentifier;
-            var member = ResolveMember(clrType, keyFieldName)
-                ?? throw new InvalidOperationException($"Key field/property '{keyFieldName}' not found on {clrType.FullName}");
+            // ResolveMember always throws rather than returning null on failure.
+            var member = ResolveMember(clrType, keyFieldName);
             var getter = CompileGetter(clrType, member);
             var toLong = BuildElementConverter(MemberReturnType(member), combine);
 
@@ -258,6 +260,8 @@ namespace TopicManager.Extensions
         {
             EnsureKindRegistered(fromKind, nameof(fromKind));
             EnsureKindRegistered(toKind, nameof(toKind));
+            if (fromClrType == null) throw new ArgumentNullException(nameof(fromClrType));
+            if (string.IsNullOrEmpty(fromFieldName)) throw new ArgumentNullException(nameof(fromFieldName));
 
             var accessor = BuildRelationAccessor(
                 fromClrType, fromFieldName, multiplicity, presenceCheck,
@@ -325,6 +329,10 @@ namespace TopicManager.Extensions
         {
             EnsureKindRegistered(leftKind, nameof(leftKind));
             EnsureKindRegistered(rightKind, nameof(rightKind));
+            if (leftClrType == null) throw new ArgumentNullException(nameof(leftClrType));
+            if (string.IsNullOrEmpty(leftFieldName)) throw new ArgumentNullException(nameof(leftFieldName));
+            if (rightClrType == null) throw new ArgumentNullException(nameof(rightClrType));
+            if (string.IsNullOrEmpty(rightFieldName)) throw new ArgumentNullException(nameof(rightFieldName));
 
             var combine = combineIdentifier ?? DefaultCombineIdentifier;
             var leftAccessor = BuildRelationAccessor(leftClrType, leftFieldName, leftToRightMultiplicity, leftPresenceCheck, combine);
@@ -710,23 +718,34 @@ namespace TopicManager.Extensions
             };
         }
 
-        // True when a composite identifier's sub-fields are both zero (the
-        // NGVA convention for "no reference"), or the raw value is null.
-        // Returns false for identifier types with no A_resourceId/
-        // A_instanceId pair - those can never be "NIL" under this check.
-        private static bool IsNilIdentifierValue(object? raw, Type memberType)
+        // Builds a converter reporting both whether a composite identifier is
+        // NIL (A_resourceId=0 and A_instanceId=0, or the value itself is
+        // null) and, when it isn't, its combined key - resolving and
+        // compiling the A_resourceId/A_instanceId accessors exactly once,
+        // shared between both pieces of information. (Earlier revision
+        // resolved these via uncached reflection on every call, inside a
+        // separate IsNilIdentifierValue helper duplicating what
+        // BuildElementConverter already did - fixed by folding both into
+        // one compiled accessor built once at registration time.)
+        private static Func<object?, (bool Present, long Key)> BuildNilAwareConverter(Type elementType, Func<long, long, long> combine)
         {
-            if (raw == null) return true;
-            var resProp = memberType.GetProperty("A_resourceId", BindingFlags.Public | BindingFlags.Instance);
-            var resField = resProp == null ? memberType.GetField("A_resourceId", BindingFlags.Public | BindingFlags.Instance) : null;
-            var instProp = memberType.GetProperty("A_instanceId", BindingFlags.Public | BindingFlags.Instance);
-            var instField = instProp == null ? memberType.GetField("A_instanceId", BindingFlags.Public | BindingFlags.Instance) : null;
-            if (resProp == null && resField == null) return false;
-            if (instProp == null && instField == null) return false;
+            var underlying = Nullable.GetUnderlyingType(elementType) ?? elementType;
 
-            object? resVal = resProp != null ? resProp.GetValue(raw) : resField!.GetValue(raw);
-            object? instVal = instProp != null ? instProp.GetValue(raw) : instField!.GetValue(raw);
-            return Convert.ToInt64(resVal) == 0 && Convert.ToInt64(instVal) == 0;
+            if (IsIntegerLike(underlying))
+                return raw => raw == null ? (false, 0L) : (true, Convert.ToInt64(raw));
+
+            var resMember = ResolveMember(underlying, "A_resourceId");
+            var instMember = ResolveMember(underlying, "A_instanceId");
+            var resGetter = CompileGetter(underlying, resMember);
+            var instGetter = CompileGetter(underlying, instMember);
+
+            return raw =>
+            {
+                if (raw == null) return (false, 0L);
+                long r = Convert.ToInt64(resGetter(raw));
+                long i = Convert.ToInt64(instGetter(raw));
+                return (r == 0 && i == 0) ? (false, 0L) : (true, combine(r, i));
+            };
         }
 
         // Builds the Func<object,IEnumerable<long>> a RelationDef needs,
@@ -759,19 +778,20 @@ namespace TopicManager.Extensions
                 };
             }
 
-            var scalarToLong = BuildElementConverter(memberType, combine);
-
             if (multiplicity == Multiplicity.One)
+            {
+                var scalarToLong = BuildElementConverter(memberType, combine);
                 return obj => AggregationEngine.One(scalarToLong(getter(obj)));
+            }
 
             // ZeroOrOne
             if (presenceCheck == PresenceCheck.NilIdentifier)
             {
+                var nilAware = BuildNilAwareConverter(memberType, combine);
                 return obj =>
                 {
-                    var raw = getter(obj);
-                    bool present = !IsNilIdentifierValue(raw, memberType);
-                    return AggregationEngine.ZeroOrOne(present, present ? scalarToLong(raw) : 0L);
+                    var (present, key) = nilAware(getter(obj));
+                    return AggregationEngine.ZeroOrOne(present, key);
                 };
             }
 
@@ -779,11 +799,12 @@ namespace TopicManager.Extensions
             // real null when HasValue is false and a boxed T when true, so
             // getter(obj) already collapses to a plain null/non-null check -
             // no further reflection needed per call.
+            var scalarToLongForNullable = BuildElementConverter(memberType, combine);
             return obj =>
             {
                 var raw = getter(obj);
                 bool present = raw != null;
-                return AggregationEngine.ZeroOrOne(present, present ? scalarToLong(raw) : 0L);
+                return AggregationEngine.ZeroOrOne(present, present ? scalarToLongForNullable(raw) : 0L);
             };
         }
 
