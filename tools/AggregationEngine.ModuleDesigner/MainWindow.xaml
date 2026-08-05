@@ -1,0 +1,119 @@
+<Window x:Class="AggregationEngine.ModuleDesigner.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="clr-namespace:AggregationEngine.ModuleDesigner.ViewModels"
+        Title="AggregationEngine.ModuleDesigner" Height="800" Width="1300"
+        MinHeight="600" MinWidth="1000">
+    <Window.Resources>
+        <BooleanToVisibilityConverter x:Key="BoolToVis"/>
+    </Window.Resources>
+
+    <Grid Margin="10">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <!-- Files row -->
+        <StackPanel Grid.Row="0" Orientation="Horizontal" Margin="0,0,0,8">
+            <Button Content="Add .cs Files..." Padding="10,4" Click="OnAddFiles"/>
+            <Button Content="Remove Selected" Padding="10,4" Margin="8,0,0,0" Click="OnRemoveFiles"/>
+            <Button Content="Analyze" Padding="16,4" Margin="16,0,0,0" FontWeight="Bold"
+                    Command="{Binding AnalyzeCommand}"/>
+            <TextBlock Text="{Binding StatusText}" VerticalAlignment="Center" Margin="16,0,0,0" TextWrapping="Wrap"/>
+        </StackPanel>
+
+        <!-- Main content -->
+        <Grid Grid.Row="1">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="1*" MinHeight="80"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="2*" MinHeight="120"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="1.4*" MinHeight="100"/>
+            </Grid.RowDefinitions>
+
+            <!-- Source files -->
+            <GroupBox Grid.Row="0" Header="Source .cs files">
+                <ListBox x:Name="FilesListBox" ItemsSource="{Binding SourceFiles}" SelectionMode="Extended"/>
+            </GroupBox>
+
+            <GridSplitter Grid.Row="1" HorizontalAlignment="Stretch" Height="4" Background="#DDD"/>
+
+            <!-- Topics -->
+            <GroupBox Grid.Row="2" Header="Detected Topics (Kinds) - confirm which to include and which are roots">
+                <DataGrid ItemsSource="{Binding Topics}" AutoGenerateColumns="False" CanUserAddRows="False"
+                          RowHeaderWidth="0" GridLinesVisibility="Horizontal">
+                    <DataGrid.Columns>
+                        <DataGridCheckBoxColumn Header="Include" Binding="{Binding Include, UpdateSourceTrigger=PropertyChanged}" Width="60"/>
+                        <DataGridCheckBoxColumn Header="Root" Binding="{Binding IsRoot, UpdateSourceTrigger=PropertyChanged}" Width="50"/>
+                        <DataGridTextColumn Header="Class" Binding="{Binding ClassName}" Width="220" IsReadOnly="True"/>
+                        <DataGridTextColumn Header="Namespace" Binding="{Binding Namespace}" Width="200" IsReadOnly="True"/>
+                        <DataGridTextColumn Header="Key field" Binding="{Binding KeyField, UpdateSourceTrigger=PropertyChanged}" Width="120"/>
+                        <DataGridTextColumn Header="Fields" Binding="{Binding FieldCount}" Width="60" IsReadOnly="True"/>
+                        <DataGridTextColumn Header="Source file" Binding="{Binding SourceFile}" Width="*" IsReadOnly="True"/>
+                    </DataGrid.Columns>
+                </DataGrid>
+            </GroupBox>
+
+            <GridSplitter Grid.Row="3" HorizontalAlignment="Stretch" Height="4" Background="#DDD"/>
+
+            <!-- Relations -->
+            <GroupBox Grid.Row="4" Header="Detected Relations - review target class, direction, multiplicity and presence check before exporting">
+                <DataGrid ItemsSource="{Binding Relations}" AutoGenerateColumns="False" CanUserAddRows="False"
+                          RowHeaderWidth="0" GridLinesVisibility="Horizontal">
+                    <DataGrid.Columns>
+                        <DataGridTextColumn Header="From" Binding="{Binding FromClass}" Width="180" IsReadOnly="True"/>
+                        <DataGridTextColumn Header="Field" Binding="{Binding FromField}" Width="220" IsReadOnly="True"/>
+                        <!-- DataGridComboBoxColumn.ItemsSource can't bind via {Binding} (columns
+                             sit outside the visual tree and have no DataContext); since the
+                             class list is dynamic (changes per Analyze), these two use a
+                             DataGridTemplateColumn with a real ComboBox instead, which does
+                             have the row's DataContext. -->
+                        <DataGridTemplateColumn Header="Target class" Width="200">
+                            <DataGridTemplateColumn.CellTemplate>
+                                <DataTemplate>
+                                    <ComboBox ItemsSource="{Binding AvailableClassNames}"
+                                              SelectedItem="{Binding ToClass, UpdateSourceTrigger=PropertyChanged}"
+                                              IsEditable="False"/>
+                                </DataTemplate>
+                            </DataGridTemplateColumn.CellTemplate>
+                        </DataGridTemplateColumn>
+                        <DataGridCheckBoxColumn Header="Bidirectional" Binding="{Binding Bidirectional, UpdateSourceTrigger=PropertyChanged}" Width="80"/>
+                        <DataGridComboBoxColumn Header="Multiplicity" SelectedItemBinding="{Binding Multiplicity, UpdateSourceTrigger=PropertyChanged}"
+                                                 ItemsSource="{x:Static vm:Options.Multiplicities}" Width="110"/>
+                        <DataGridTemplateColumn Header="Reciprocal field" Width="150">
+                            <DataGridTemplateColumn.CellTemplate>
+                                <DataTemplate>
+                                    <ComboBox ItemsSource="{Binding AvailableClassNames}"
+                                              SelectedItem="{Binding ReciprocalField, UpdateSourceTrigger=PropertyChanged}"
+                                              IsEditable="True" Visibility="{Binding ShowReciprocalFields, Converter={StaticResource BoolToVis}}"/>
+                                </DataTemplate>
+                            </DataGridTemplateColumn.CellTemplate>
+                        </DataGridTemplateColumn>
+                        <DataGridComboBoxColumn Header="Reciprocal mult." SelectedItemBinding="{Binding ReciprocalMultiplicity, UpdateSourceTrigger=PropertyChanged}"
+                                                 ItemsSource="{x:Static vm:Options.Multiplicities}" Width="120"/>
+                        <DataGridComboBoxColumn Header="Presence check" SelectedItemBinding="{Binding PresenceCheck, UpdateSourceTrigger=PropertyChanged}"
+                                                 ItemsSource="{x:Static vm:Options.PresenceChecks}" Width="120"/>
+                        <DataGridTextColumn Header="Confidence" Binding="{Binding Confidence, StringFormat={}{0:F2}}" Width="80" IsReadOnly="True"/>
+                    </DataGrid.Columns>
+                </DataGrid>
+            </GroupBox>
+        </Grid>
+
+        <!-- Export -->
+        <Grid Grid.Row="2" Margin="0,10,0,0">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="200"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
+            <TextBlock Text="Module name:" VerticalAlignment="Center" Margin="0,0,8,0"/>
+            <TextBox Grid.Column="1" Text="{Binding ModuleName, UpdateSourceTrigger=PropertyChanged}" VerticalContentAlignment="Center"/>
+            <Button Grid.Column="2" Content="Generate JSON and Save As..." Padding="12,4" Margin="12,0,0,0"
+                    Command="{Binding GenerateJsonCommand}"/>
+        </Grid>
+    </Grid>
+</Window>
