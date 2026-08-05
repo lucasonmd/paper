@@ -38,7 +38,16 @@ namespace AggregationEngine.ModuleDesigner.Core
                 ["relations"] = new JsonArray(relations.Select(r => (JsonNode)WriteRelation(r)).ToArray()),
             };
 
-            var options = new JsonSerializerOptions { WriteIndented = true };
+            // Default JsonSerializerOptions HTML-escape '>','<','&' etc.
+            // (> and friends) - a safe default for JSON embedded in a
+            // <script> tag, irrelevant here and just noise in a file meant
+            // to be read/reviewed by a person. Relaxed escaping keeps
+            // "A->B"-style relation names literal.
+            var options = new JsonSerializerOptions
+            {
+                WriteIndented = true,
+                Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+            };
             return root.ToJsonString(options);
         }
 
