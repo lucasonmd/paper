@@ -3,7 +3,7 @@ using System.IO;
 using P_Mount_PSM;
 using TopicManager.Extensions;
 
-namespace AggregationEngine.Simple
+namespace AggregationEngine.JsonSample
 {
     // End-to-end verification that a topic module can be stood up from
     // JSON alone: this file never calls RegisterKind/RegisterUnidirectional/
