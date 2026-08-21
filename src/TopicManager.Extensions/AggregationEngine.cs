@@ -47,6 +47,71 @@ namespace TopicManager.Extensions
         }
     }
 
+    // A relation index entry: an immutable, ascending-sorted key set.
+    //
+    // This replaces ImmutableHashSet<long>. Both are copy-on-write values
+    // published atomically into a ConcurrentDictionary, so readers stay
+    // lock-free either way -- but every traversal *enumerates* these sets,
+    // and walking an AVL tree per edge is far more expensive than a linear
+    // scan over an array. Sorting keeps Contains at O(log n) for the
+    // reciprocal check and makes the write-side set algebra a linear merge.
+    internal static class KeySet
+    {
+        public static readonly long[] Empty = Array.Empty<long>();
+
+        public static long[] Of(IEnumerable<long> keys)
+        {
+            if (keys is null) return Empty;
+            var buf = keys as long[] ?? keys.ToArray();
+            if (buf.Length <= 1) return buf.Length == 0 ? Empty : new[] { buf[0] };
+            var copy = (long[])buf.Clone();
+            Array.Sort(copy);
+            // drop duplicates -- the source is a reference list, not a set
+            int w = 1;
+            for (int r = 1; r < copy.Length; r++)
+                if (copy[r] != copy[w - 1]) copy[w++] = copy[r];
+            if (w == copy.Length) return copy;
+            var trimmed = new long[w];
+            Array.Copy(copy, trimmed, w);
+            return trimmed;
+        }
+
+        public static bool Contains(long[] set, long key) =>
+            set.Length != 0 && Array.BinarySearch(set, key) >= 0;
+
+        public static bool SetEquals(long[] a, long[] b)
+        {
+            if (ReferenceEquals(a, b)) return true;
+            if (a.Length != b.Length) return false;
+            for (int i = 0; i < a.Length; i++)
+                if (a[i] != b[i]) return false;
+            return true;
+        }
+
+        public static long[] Add(long[] set, long key)
+        {
+            int at = Array.BinarySearch(set, key);
+            if (at >= 0) return set;
+            at = ~at;
+            var next = new long[set.Length + 1];
+            Array.Copy(set, 0, next, 0, at);
+            next[at] = key;
+            Array.Copy(set, at, next, at + 1, set.Length - at);
+            return next;
+        }
+
+        public static long[] Remove(long[] set, long key)
+        {
+            int at = Array.BinarySearch(set, key);
+            if (at < 0) return set;
+            if (set.Length == 1) return Empty;
+            var next = new long[set.Length - 1];
+            Array.Copy(set, 0, next, 0, at);
+            Array.Copy(set, at + 1, next, at, set.Length - at - 1);
+            return next;
+        }
+    }
+
     internal sealed class RelationDef
     {
         public string Name { get; }
@@ -55,8 +120,8 @@ namespace TopicManager.Extensions
         public Multiplicity FromToMultiplicity { get; }
         public Func<object, IEnumerable<long>> GetToKeysFromFrom { get; } // FromKey -> ToKeys
 
-        public ConcurrentDictionary<long, ImmutableHashSet<long>> Forward { get; } = new(); // ToKey -> FromKeys
-        public ConcurrentDictionary<long, ImmutableHashSet<long>> Reverse { get; } = new();
+        public ConcurrentDictionary<long, long[]> Forward { get; } = new(); // ToKey -> FromKeys
+        public ConcurrentDictionary<long, long[]> Reverse { get; } = new();
 
         // Serializes index writers per relation; readers stay lock-free.
         public object WriteGate { get; } = new object();
@@ -119,8 +184,11 @@ namespace TopicManager.Extensions
         private readonly ConcurrentDictionary<Type, KindId> _typeToKind = new();
         private int _nextKind = 0;
         private readonly ConcurrentDictionary<KindId, KindDef> _kinds = new();
-        private readonly ConcurrentDictionary<KindId, ImmutableList<RelationDef>> _relsByFrom = new();
-        private readonly ConcurrentDictionary<KindId, ImmutableList<RelationDef>> _relsByTo = new();
+        // Arrays, not ImmutableList: these are written only at registration
+        // time but enumerated once per node on every traversal, and an
+        // ImmutableList enumeration walks a tree.
+        private readonly ConcurrentDictionary<KindId, RelationDef[]> _relsByFrom = new();
+        private readonly ConcurrentDictionary<KindId, RelationDef[]> _relsByTo = new();
         private readonly ConcurrentDictionary<KindId, bool> _rootKinds = new();
 
         // Per-root emission state: computation gate + FIFO queue so that
@@ -148,10 +216,6 @@ namespace TopicManager.Extensions
 
         private readonly ConcurrentDictionary<RootId, RootEmitState> _emitByRoot = new();
 
-        // Last emitted member set per root; populated only while
-        // SuppressUnchangedSnapshots is enabled.
-        private readonly ConcurrentDictionary<RootId, Dictionary<EntityId, object>> _lastEmitted = new();
-
         // Root-kind routing handlers
         private readonly ConcurrentDictionary<KindId, List<Action<RootId, AggregateSnapshot>>> _rootKindHandlers = new();
 
@@ -172,10 +236,6 @@ namespace TopicManager.Extensions
         // reverse half of bidirectional relations and do not descend into
         // other root-kind instances. Reciprocal validation still applies.
         public bool IsolateAggregateBoundaries { get; set; }
-
-        // Skip emission when the snapshot has the same members with the same
-        // object instances as the previous emission for that root.
-        public bool SuppressUnchangedSnapshots { get; set; }
 
         // -------------------------
         // Registration
@@ -550,7 +610,6 @@ namespace TopicManager.Extensions
             {
                 var rid = new RootId(kind, key);
                 _emitByRoot.TryRemove(rid, out _);
-                _lastEmitted.TryRemove(rid, out _);
             }
             return true;
         }
@@ -811,45 +870,55 @@ namespace TopicManager.Extensions
         private void AddRelation(RelationDef rel)
         {
             _relsByFrom.AddOrUpdate(rel.From,
-                _ => ImmutableList.Create(rel),
-                (_, list) => list.Add(rel));
+                _ => new[] { rel },
+                (_, list) => Append(list, rel));
 
             _relsByTo.AddOrUpdate(rel.To,
-                _ => ImmutableList.Create(rel),
-                (_, list) => list.Add(rel));
+                _ => new[] { rel },
+                (_, list) => Append(list, rel));
+        }
+
+        private static RelationDef[] Append(RelationDef[] list, RelationDef rel)
+        {
+            var next = new RelationDef[list.Length + 1];
+            Array.Copy(list, next, list.Length);
+            next[list.Length] = rel;
+            return next;
         }
 
         private void UpdateIndexesForFrom(RelationDef rel, object fromEntity, long fromKey)
         {
-            var newTargets = (rel.GetToKeysFromFrom(fromEntity) ?? Array.Empty<long>()).ToImmutableHashSet();
+            var newTargets = KeySet.Of(rel.GetToKeysFromFrom(fromEntity));
 
             lock (rel.WriteGate)
             {
-                rel.Forward.TryGetValue(fromKey, out var oldTargets);
-                oldTargets ??= ImmutableHashSet<long>.Empty;
+                if (!rel.Forward.TryGetValue(fromKey, out var oldTargets) || oldTargets is null)
+                    oldTargets = KeySet.Empty;
 
                 // Periodic republication with unchanged references: no-op.
-                if (newTargets.SetEquals(oldTargets)) return;
+                if (KeySet.SetEquals(newTargets, oldTargets)) return;
 
                 // Add new reverse links before switching Forward, and remove
                 // stale ones after, so concurrent traversals see a superset
                 // of edges (transient over-reach instead of missed roots).
-                foreach (var added in newTargets.Except(oldTargets))
+                foreach (var added in newTargets)
                 {
+                    if (KeySet.Contains(oldTargets, added)) continue;
                     rel.Reverse.AddOrUpdate(
                         added,
-                        _ => ImmutableHashSet<long>.Empty.Add(fromKey),
-                        (_, set) => set.Add(fromKey));
+                        _ => new[] { fromKey },
+                        (_, set) => KeySet.Add(set, fromKey));
                 }
 
                 rel.Forward[fromKey] = newTargets;
 
-                foreach (var removed in oldTargets.Except(newTargets))
+                foreach (var removed in oldTargets)
                 {
+                    if (KeySet.Contains(newTargets, removed)) continue;
                     rel.Reverse.AddOrUpdate(
                         removed,
-                        _ => ImmutableHashSet<long>.Empty,
-                        (_, set) => set.Remove(fromKey));
+                        _ => KeySet.Empty,
+                        (_, set) => KeySet.Remove(set, fromKey));
                 }
             }
         }
@@ -864,8 +933,8 @@ namespace TopicManager.Extensions
                 {
                     rel.Reverse.AddOrUpdate(
                         removed,
-                        _ => ImmutableHashSet<long>.Empty,
-                        (_, set) => set.Remove(fromKey));
+                        _ => KeySet.Empty,
+                        (_, set) => KeySet.Remove(set, fromKey));
                 }
             }
         }
@@ -894,7 +963,7 @@ namespace TopicManager.Extensions
                     {
                         if (rel.Reverse.TryGetValue(cur.Key, out var fromKeys))
                         {
-                            fromKeys ??= ImmutableHashSet<long>.Empty;
+                            fromKeys ??= KeySet.Empty;
                             foreach (var fromKey in fromKeys)
                                 q.Enqueue(new EntityId(rel.From, fromKey));
                         }
@@ -908,7 +977,7 @@ namespace TopicManager.Extensions
                     {
                         if (rel.Forward.TryGetValue(cur.Key, out var toKeys))
                         {
-                            toKeys ??= ImmutableHashSet<long>.Empty;
+                            toKeys ??= KeySet.Empty;
                             foreach (var toKey in toKeys)
                                 q.Enqueue(new EntityId(rel.To, toKey));
                         }
@@ -929,15 +998,11 @@ namespace TopicManager.Extensions
                 if (!_kinds.TryGetValue(root.Kind, out var rootKindDef)) return;
                 if (!rootKindDef.Store.ContainsKey(root.Key)) return;
 
-                var snapshot = Assemble(root);
-                if (!IsComplete(root, snapshot)) return;
+                if (!TryAssembleComplete(root, out var snapshot)) return;
 
                 if (EmitOnlyAffectedRoots
                     && !(root.Kind == changed.Kind && root.Key == changed.Key)
                     && !SnapshotContains(snapshot, changed))
-                    return;
-
-                if (SuppressUnchangedSnapshots && !UpdateLastEmitted(root, snapshot))
                     return;
 
                 Action<RootId, AggregateSnapshot>[] copy = Array.Empty<Action<RootId, AggregateSnapshot>>();
@@ -999,36 +1064,6 @@ namespace TopicManager.Extensions
             return false;
         }
 
-        // Returns false when the snapshot is member-and-reference identical
-        // to the previous emission for this root. Called under the root gate.
-        private bool UpdateLastEmitted(RootId root, AggregateSnapshot snapshot)
-        {
-            var sig = new Dictionary<EntityId, object>();
-            foreach (var (kind, list) in snapshot.Raw)
-            {
-                if (!_kinds.TryGetValue(kind, out var kd)) continue;
-                foreach (var obj in list)
-                    sig[new EntityId(kind, kd.GetKey(obj))] = obj;
-            }
-
-            if (_lastEmitted.TryGetValue(root, out var prev) && prev.Count == sig.Count)
-            {
-                var same = true;
-                foreach (var kv in sig)
-                {
-                    if (!prev.TryGetValue(kv.Key, out var p) || !ReferenceEquals(p, kv.Value))
-                    {
-                        same = false;
-                        break;
-                    }
-                }
-                if (same) return false;
-            }
-
-            _lastEmitted[root] = sig;
-            return true;
-        }
-
         private bool SkipTraversal(RelationDef rel) =>
             IsolateAggregateBoundaries && rel.IsReciprocalSecondary;
 
@@ -1037,99 +1072,63 @@ namespace TopicManager.Extensions
             && _rootKinds.ContainsKey(cur.Kind)
             && !(cur.Kind == root.Kind && cur.Key == root.Key);
 
-        // Assemble from root following Forward edges only.
-        private AggregateSnapshot Assemble(RootId root)
+        // Walks the aggregate from the root over Forward edges once, building
+        // the snapshot and checking completeness in the same pass.
+        //
+        // This used to be two methods -- Assemble() then IsComplete() -- which
+        // walked the identical edge set twice and, in between, rebuilt a
+        // HashSet of every member just to answer "did this key arrive?". The
+        // store lookup that Assemble already performs answers the same
+        // question, so the second walk and the set were pure duplication.
+        // Bailing out on the first unresolved reference also means an
+        // incomplete aggregate no longer pays for a full traversal.
+        private bool TryAssembleComplete(RootId root, out AggregateSnapshot snapshot)
         {
-            var byKind = new Dictionary<KindId, Dictionary<long, object>>();
+            snapshot = null!;
 
-            void TryAdd(EntityId id)
-            {
-                if (!_kinds.TryGetValue(id.Kind, out var kd)) return;
-                if (!kd.Store.TryGetValue(id.Key, out var entity)) return;
-
-                if (!byKind.TryGetValue(id.Kind, out var map))
-                {
-                    map = new Dictionary<long, object>();
-                    byKind[id.Kind] = map;
-                }
-                map[id.Key] = entity;
-            }
-
-            var visited = new HashSet<EntityId>();
-            var q = new Queue<EntityId>();
-            q.Enqueue(new EntityId(root.Kind, root.Key));
-
-            while (q.Count > 0)
-            {
-                var cur = q.Dequeue();
-                if (!visited.Add(cur)) continue;
-
-                TryAdd(cur);
-
-                // Boundary isolation: reference other roots shallowly.
-                if (IsForeignRoot(root, cur)) continue;
-
-                if (_relsByFrom.TryGetValue(cur.Kind, out var outgoing))
-                {
-                    foreach (var rel in outgoing)
-                    {
-                        if (SkipTraversal(rel)) continue;
-                        if (rel.Forward.TryGetValue(cur.Key, out var toKeys))
-                        {
-                            toKeys ??= ImmutableHashSet<long>.Empty;
-                            foreach (var toKey in toKeys)
-                                q.Enqueue(new EntityId(rel.To, toKey));
-                        }
-                    }
-                }
-            }
-
-            var final = byKind.ToDictionary(
-                kv => kv.Key,
-                kv => (IReadOnlyList<object>)kv.Value.Values.ToList());
-
-            return new AggregateSnapshot(final);
-        }
-
-        private bool IsComplete(RootId root, AggregateSnapshot snapshot)
-        {
-            var present = new HashSet<EntityId>();
-            foreach (var (kind, list) in snapshot.Raw)
-            {
-                if (!_kinds.TryGetValue(kind, out var kd)) continue;
-                foreach (var obj in list)
-                {
-                    var key = kd.GetKey(obj);
-                    present.Add(new EntityId(kind, key));
-                }
-            }
-
-            if (!present.Contains(new EntityId(root.Kind, root.Key))) return false;
+            var rootId = new EntityId(root.Kind, root.Key);
+            if (!_kinds.TryGetValue(root.Kind, out var rootKind)
+                || !rootKind.Store.ContainsKey(root.Key))
+                return false;
 
             static bool RequiresAtLeastOne(Multiplicity m) =>
                 m == Multiplicity.One || m == Multiplicity.OneOrMany;
 
-            bool IsValidLink(RelationDef rel, long fromKey, long toKey)
+            static bool IsValidLink(RelationDef rel, long fromKey, long toKey)
             {
                 // Unidirectional: accept if present.
                 if (rel.Reciprocal is null) return true;
 
                 // Bidirectional: require reciprocal match (toKey must reference fromKey).
                 if (!rel.Reciprocal.Forward.TryGetValue(toKey, out var backTargets)) return false;
-                backTargets ??= ImmutableHashSet<long>.Empty;
-                return backTargets.Contains(fromKey);
+                return backTargets is not null && KeySet.Contains(backTargets, fromKey);
             }
 
-            var visited = new HashSet<EntityId>();
+            // BFS dedup happens on enqueue, so the queue never holds a node
+            // twice and each member is added to its kind list exactly once --
+            // no per-kind dictionary is needed to deduplicate afterwards.
+            var byKind = new Dictionary<KindId, List<object>>();
+            var visited = new HashSet<EntityId> { rootId };
             var q = new Queue<EntityId>();
-            q.Enqueue(new EntityId(root.Kind, root.Key));
+            q.Enqueue(rootId);
 
             while (q.Count > 0)
             {
                 var cur = q.Dequeue();
-                if (!visited.Add(cur)) continue;
 
-                // Boundary isolation: do not impose another root's obligations.
+                if (_kinds.TryGetValue(cur.Kind, out var kd)
+                    && kd.Store.TryGetValue(cur.Key, out var entity))
+                {
+                    if (!byKind.TryGetValue(cur.Kind, out var list))
+                    {
+                        list = new List<object>();
+                        byKind[cur.Kind] = list;
+                    }
+                    list.Add(entity);
+                }
+
+                // Boundary isolation: reference other roots shallowly and do
+                // not impose their obligations on this aggregate.
                 if (IsForeignRoot(root, cur)) continue;
 
                 if (!_relsByFrom.TryGetValue(cur.Kind, out var outgoing)) continue;
@@ -1138,26 +1137,36 @@ namespace TopicManager.Extensions
                 {
                     if (SkipTraversal(rel)) continue;
 
-                    if (!rel.Forward.TryGetValue(cur.Key, out var toKeys))
-                        toKeys = ImmutableHashSet<long>.Empty;
-                    toKeys ??= ImmutableHashSet<long>.Empty;
+                    if (!rel.Forward.TryGetValue(cur.Key, out var toKeys) || toKeys is null)
+                        toKeys = KeySet.Empty;
 
-                    int validExistingCount = 0;
-                    foreach (var toKey in toKeys)
+                    // Multiplicity sets the allowed number of references;
+                    // completeness additionally requires every explicitly
+                    // referenced target to have arrived.  In particular, an
+                    // optional/Many relation with a non-empty key set is not
+                    // complete while any of those keys is unresolved.
+                    if (toKeys.Length == 0)
                     {
-                        var toId = new EntityId(rel.To, toKey);
-                        if (!present.Contains(toId)) continue;
-                        if (!IsValidLink(rel, cur.Key, toKey)) continue;
-
-                        validExistingCount++;
-                        q.Enqueue(toId);
+                        if (RequiresAtLeastOne(rel.FromToMultiplicity)) return false;
+                        continue;
                     }
 
-                    if (RequiresAtLeastOne(rel.FromToMultiplicity) && validExistingCount == 0)
-                        return false;
+                    if (!_kinds.TryGetValue(rel.To, out var toKind)) return false;
+
+                    foreach (var toKey in toKeys)
+                    {
+                        if (!toKind.Store.ContainsKey(toKey)) return false;
+                        if (!IsValidLink(rel, cur.Key, toKey)) return false;
+
+                        var toId = new EntityId(rel.To, toKey);
+                        if (visited.Add(toId)) q.Enqueue(toId);
+                    }
                 }
             }
 
+            var final = new Dictionary<KindId, IReadOnlyList<object>>(byKind.Count);
+            foreach (var kv in byKind) final[kv.Key] = kv.Value;
+            snapshot = new AggregateSnapshot(final);
             return true;
         }
 

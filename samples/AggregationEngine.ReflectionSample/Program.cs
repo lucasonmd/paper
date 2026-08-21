@@ -38,35 +38,35 @@ namespace AggregationEngine.ReflectionSample
         {
             var engine = new global::TopicManager.Extensions.AggregationEngine();
 
-            var mountKind = engine.RegisterKind(typeof(Mount), "A_sourceID");
-            var specKind = engine.RegisterKind(typeof(Specification), "A_sourceID");
-            var softLimitsKind = engine.RegisterKind(typeof(SoftLimits), "A_sourceID");
-            var zoneKind = engine.RegisterKind(typeof(InhibitZone), "A_sourceID");
-            var targetKind = engine.RegisterKind(typeof(TargetPosition), "A_sourceID");
+            var mountKind = engine.RegisterKind(typeof(LinearMount), "A_sourceID");
+            var specKind = engine.RegisterKind(typeof(LinearMountSpecification), "A_sourceID");
+            var softLimitsKind = engine.RegisterKind(typeof(LinearSoftLimits), "A_sourceID");
+            var partKind = engine.RegisterKind(typeof(MountPart), "A_sourceID");
+            var targetKind = engine.RegisterKind(typeof(LinearTargetPosition), "A_sourceID");
 
             engine.RegisterRootKind(mountKind);
 
             engine.RegisterUnidirectional(
-                "Mount->Specification", mountKind, specKind, Multiplicity.One,
-                typeof(Mount), "A_specification_sourceID");
+                "LinearMount->LinearMountSpecification", mountKind, specKind, Multiplicity.One,
+                typeof(LinearMount), "A_specification_sourceID");
 
             engine.RegisterBidirectional(
-                "Mount<->SoftLimits", mountKind, softLimitsKind,
+                "LinearMount<->LinearSoftLimits", mountKind, softLimitsKind,
                 Multiplicity.One, Multiplicity.One,
-                typeof(Mount), "A_softLimits_sourceID",
-                typeof(SoftLimits), "A_rotationalMount_sourceID");
+                typeof(LinearMount), "A_softLimits_sourceID",
+                typeof(LinearSoftLimits), "A_linearMount_sourceID");
 
             engine.RegisterBidirectional(
-                "Mount<->InhibitZone", mountKind, zoneKind,
+                "LinearMount<->MountPart", mountKind, partKind,
                 Multiplicity.ZeroOrMany, Multiplicity.One,
-                typeof(Mount), "A_movementInhibitZones_sourceID",
-                typeof(InhibitZone), "A_rotationalMount_sourceID");
+                typeof(LinearMount), "A_parts_sourceID",
+                typeof(MountPart), "A_linearMount_sourceID");
 
             engine.RegisterBidirectional(
-                "Mount<->TargetPosition", mountKind, targetKind,
+                "LinearMount<->LinearTargetPosition", mountKind, targetKind,
                 Multiplicity.ZeroOrOne, Multiplicity.One,
-                typeof(Mount), "A_targetPosition_sourceID",
-                typeof(TargetPosition), "A_rotationalMount_sourceID",
+                typeof(LinearMount), "A_targetPosition_sourceID",
+                typeof(LinearTargetPosition), "A_linearMount_sourceID",
                 leftPresenceCheck: PresenceCheck.NilIdentifier);
 
             AggregateSnapshot? lastSnapshot = null;
@@ -75,17 +75,17 @@ namespace AggregationEngine.ReflectionSample
             {
                 emitCount++;
                 lastSnapshot = snapshot;
-                Console.WriteLine($"[emit #{emitCount}] root=Mount#{root.Key}");
+                Console.WriteLine($"[emit #{emitCount}] root=LinearMount#{root.Key}");
             });
 
             var mountId = new T_IdentifierType(1, 100);
             var specId = new T_IdentifierType(2, 100);
             var softLimitsId = new T_IdentifierType(3, 100);
 
-            Console.WriteLine("-- feeding parts, then the mount with TargetPosition = NIL and 0 zones --");
-            engine.Upsert(specKind, new Specification { A_sourceID = specId });
-            engine.Upsert(softLimitsKind, new SoftLimits { A_sourceID = softLimitsId, A_rotationalMount_sourceID = mountId });
-            engine.Upsert(mountKind, new Mount
+            Console.WriteLine("-- feeding parts, then the mount with LinearTargetPosition = NIL and 0 parts --");
+            engine.Upsert(specKind, new LinearMountSpecification { A_sourceID = specId });
+            engine.Upsert(softLimitsKind, new LinearSoftLimits { A_sourceID = softLimitsId, A_linearMount_sourceID = mountId });
+            engine.Upsert(mountKind, new LinearMount
             {
                 A_sourceID = mountId,
                 A_specification_sourceID = specId,
@@ -94,17 +94,17 @@ namespace AggregationEngine.ReflectionSample
             });
 
             Check(emitCount == 1, "composite-key registration + ZeroOrOne/NIL completes with exactly one emission");
-            Check(lastSnapshot != null && lastSnapshot.TryGetOne<Mount>(mountKind, out _), "snapshot contains the Mount itself");
-            Check(lastSnapshot != null && !lastSnapshot.TryGetOne<TargetPosition>(targetKind, out _), "NIL TargetPosition correctly absent from snapshot");
-            System.Collections.Generic.IReadOnlyList<InhibitZone> zonesEmpty = System.Array.Empty<InhibitZone>();
-            lastSnapshot?.TryGetMany(zoneKind, out zonesEmpty);
-            Check(zonesEmpty.Count == 0, "zero zones correctly reflected as an empty list (TryGetMany returns false, items still empty)");
+            Check(lastSnapshot != null && lastSnapshot.TryGetOne<LinearMount>(mountKind, out _), "snapshot contains the LinearMount itself");
+            Check(lastSnapshot != null && !lastSnapshot.TryGetOne<LinearTargetPosition>(targetKind, out _), "NIL LinearTargetPosition correctly absent from snapshot");
+            System.Collections.Generic.IReadOnlyList<MountPart> partsEmpty = System.Array.Empty<MountPart>();
+            lastSnapshot?.TryGetMany(partKind, out partsEmpty);
+            Check(partsEmpty.Count == 0, "zero parts correctly reflected as an empty list (TryGetMany returns false, items still empty)");
 
             Console.WriteLine();
-            Console.WriteLine("-- adding a real TargetPosition, expect re-emission with it present --");
+            Console.WriteLine("-- adding a real LinearTargetPosition, expect re-emission with it present --");
             var targetId = new T_IdentifierType(4, 100);
-            engine.Upsert(targetKind, new TargetPosition { A_sourceID = targetId, A_rotationalMount_sourceID = mountId });
-            engine.Upsert(mountKind, new Mount
+            engine.Upsert(targetKind, new LinearTargetPosition { A_sourceID = targetId, A_linearMount_sourceID = mountId });
+            engine.Upsert(mountKind, new LinearMount
             {
                 A_sourceID = mountId,
                 A_specification_sourceID = specId,
@@ -112,25 +112,25 @@ namespace AggregationEngine.ReflectionSample
                 A_targetPosition_sourceID = targetId,
             });
 
-            Check(lastSnapshot != null && lastSnapshot.TryGetOne<TargetPosition>(targetKind, out _), "non-NIL TargetPosition correctly present after update");
+            Check(lastSnapshot != null && lastSnapshot.TryGetOne<LinearTargetPosition>(targetKind, out _), "non-NIL LinearTargetPosition correctly present after update");
 
             Console.WriteLine();
-            Console.WriteLine("-- adding two InhibitZones (array-of-composite-identifier, ZeroOrMany) --");
-            var zone1 = new T_IdentifierType(5, 100);
-            var zone2 = new T_IdentifierType(5, 101);
-            engine.Upsert(zoneKind, new InhibitZone { A_sourceID = zone1, A_rotationalMount_sourceID = mountId });
-            engine.Upsert(zoneKind, new InhibitZone { A_sourceID = zone2, A_rotationalMount_sourceID = mountId });
-            engine.Upsert(mountKind, new Mount
+            Console.WriteLine("-- adding two parts (array-of-composite-identifier, ZeroOrMany) --");
+            var part1 = new T_IdentifierType(5, 100);
+            var part2 = new T_IdentifierType(5, 101);
+            engine.Upsert(partKind, new MountPart { A_sourceID = part1, A_linearMount_sourceID = mountId });
+            engine.Upsert(partKind, new MountPart { A_sourceID = part2, A_linearMount_sourceID = mountId });
+            engine.Upsert(mountKind, new LinearMount
             {
                 A_sourceID = mountId,
                 A_specification_sourceID = specId,
                 A_softLimits_sourceID = softLimitsId,
                 A_targetPosition_sourceID = targetId,
-                A_movementInhibitZones_sourceID = new[] { zone1, zone2 },
+                A_parts_sourceID = new[] { part1, part2 },
             });
 
-            Check(lastSnapshot != null && lastSnapshot.TryGetMany<InhibitZone>(zoneKind, out var zonesTwo) && zonesTwo.Count == 2,
-                "array-of-composite-identifier ZeroOrMany reflects both zones");
+            Check(lastSnapshot != null && lastSnapshot.TryGetMany<MountPart>(partKind, out var partsTwo) && partsTwo.Count == 2,
+                "array-of-composite-identifier ZeroOrMany reflects both parts");
 
             RunVendorSequenceCheck();
 
@@ -161,72 +161,72 @@ namespace AggregationEngine.ReflectionSample
 
             var engine = new global::TopicManager.Extensions.AggregationEngine();
 
-            var mountKind = engine.RegisterKind(typeof(SeqMount), "A_sourceID");
-            var specKind = engine.RegisterKind(typeof(SeqSpecification), "A_sourceID");
-            var zoneKind = engine.RegisterKind(typeof(SeqInhibitZone), "A_sourceID");
+            var mountKind = engine.RegisterKind(typeof(SeqLinearMount), "A_sourceID");
+            var specKind = engine.RegisterKind(typeof(SeqLinearMountSpecification), "A_sourceID");
+            var partKind = engine.RegisterKind(typeof(SeqMountPart), "A_sourceID");
 
             engine.RegisterRootKind(mountKind);
 
             engine.RegisterUnidirectional(
-                "SeqMount->Specification", mountKind, specKind, Multiplicity.One,
-                typeof(SeqMount), "A_specification_sourceID");
+                "SeqLinearMount->LinearMountSpecification", mountKind, specKind, Multiplicity.One,
+                typeof(SeqLinearMount), "A_specification_sourceID");
 
             // The field under test: ISequence<T_IdentifierType>, ZeroOrMany.
             engine.RegisterBidirectional(
-                "SeqMount<->InhibitZone", mountKind, zoneKind,
+                "SeqLinearMount<->MountPart", mountKind, partKind,
                 Multiplicity.ZeroOrMany, Multiplicity.One,
-                typeof(SeqMount), "A_movementInhibitZones_sourceID",
-                typeof(SeqInhibitZone), "A_mount_sourceID");
+                typeof(SeqLinearMount), "A_parts_sourceID",
+                typeof(SeqMountPart), "A_linearMount_sourceID");
 
             AggregateSnapshot? snap = null;
             engine.SubscribeRootKind(mountKind, (_, s) => snap = s);
 
             var mountId = new T_IdentifierType(9, 1);
             var specId = new T_IdentifierType(9, 2);
-            var z1 = new T_IdentifierType(9, 10);
-            var z2 = new T_IdentifierType(9, 11);
-            var z3 = new T_IdentifierType(9, 12);
+            var p1 = new T_IdentifierType(9, 10);
+            var p2 = new T_IdentifierType(9, 11);
+            var p3 = new T_IdentifierType(9, 12);
 
-            engine.Upsert(specKind, new SeqSpecification { A_sourceID = specId });
-            engine.Upsert(zoneKind, new SeqInhibitZone { A_sourceID = z1, A_mount_sourceID = mountId });
-            engine.Upsert(zoneKind, new SeqInhibitZone { A_sourceID = z2, A_mount_sourceID = mountId });
-            engine.Upsert(zoneKind, new SeqInhibitZone { A_sourceID = z3, A_mount_sourceID = mountId });
+            engine.Upsert(specKind, new SeqLinearMountSpecification { A_sourceID = specId });
+            engine.Upsert(partKind, new SeqMountPart { A_sourceID = p1, A_linearMount_sourceID = mountId });
+            engine.Upsert(partKind, new SeqMountPart { A_sourceID = p2, A_linearMount_sourceID = mountId });
+            engine.Upsert(partKind, new SeqMountPart { A_sourceID = p3, A_linearMount_sourceID = mountId });
 
-            engine.Upsert(mountKind, new SeqMount
+            engine.Upsert(mountKind, new SeqLinearMount
             {
                 A_sourceID = mountId,
                 A_specification_sourceID = specId,
-                A_movementInhibitZones_sourceID = new BoundedSequence<T_IdentifierType>(new[] { z1, z2, z3 }),
+                A_parts_sourceID = new BoundedSequence<T_IdentifierType>(new[] { p1, p2, p3 }),
             });
 
             Check(snap != null, "aggregate using ISequence<T> completed");
 
-            System.Collections.Generic.IReadOnlyList<SeqInhibitZone> zones = Array.Empty<SeqInhibitZone>();
-            snap?.TryGetMany(zoneKind, out zones);
-            Check(zones.Count == 3, $"all 3 zones resolved through ISequence<T> (got {zones.Count})");
+            System.Collections.Generic.IReadOnlyList<SeqMountPart> parts = Array.Empty<SeqMountPart>();
+            snap?.TryGetMany(partKind, out parts);
+            Check(parts.Count == 3, $"all 3 parts resolved through ISequence<T> (got {parts.Count})");
 
-            // Shrinking the sequence must drop the removed zone from the
+            // Shrinking the sequence must drop the removed part from the
             // snapshot - proves the sequence is re-read on every Upsert, not
             // captured once at registration.
-            engine.Upsert(mountKind, new SeqMount
+            engine.Upsert(mountKind, new SeqLinearMount
             {
                 A_sourceID = mountId,
                 A_specification_sourceID = specId,
-                A_movementInhibitZones_sourceID = new BoundedSequence<T_IdentifierType>(new[] { z1 }),
+                A_parts_sourceID = new BoundedSequence<T_IdentifierType>(new[] { p1 }),
             });
-            snap?.TryGetMany(zoneKind, out zones);
-            Check(zones.Count == 1, $"shrinking the sequence to 1 element is reflected (got {zones.Count})");
+            snap?.TryGetMany(partKind, out parts);
+            Check(parts.Count == 1, $"shrinking the sequence to 1 element is reflected (got {parts.Count})");
 
             // An empty bounded sequence is a valid ZeroOrMany state.
-            engine.Upsert(mountKind, new SeqMount
+            engine.Upsert(mountKind, new SeqLinearMount
             {
                 A_sourceID = mountId,
                 A_specification_sourceID = specId,
-                A_movementInhibitZones_sourceID = new BoundedSequence<T_IdentifierType>(),
+                A_parts_sourceID = new BoundedSequence<T_IdentifierType>(),
             });
-            zones = Array.Empty<SeqInhibitZone>();
-            snap?.TryGetMany(zoneKind, out zones);
-            Check(zones.Count == 0, $"empty ISequence<T> is a valid ZeroOrMany state (got {zones.Count})");
+            parts = Array.Empty<SeqMountPart>();
+            snap?.TryGetMany(partKind, out parts);
+            Check(parts.Count == 0, $"empty ISequence<T> is a valid ZeroOrMany state (got {parts.Count})");
         }
     }
 }

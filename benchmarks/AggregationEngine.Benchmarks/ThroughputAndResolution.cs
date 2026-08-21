@@ -77,42 +77,39 @@ namespace AggregationEngine.Benchmarks
         private static void RunThroughput(string resultsDir)
         {
             const int aggregates = 20000;
-            const int zoneCount = 5;
+            const int partCount = 5;
 
-            double legacyPerSec = MeasureLegacyThroughput(aggregates, zoneCount);
-            double engineDefaultPerSec = MeasureEngineThroughput(aggregates, zoneCount, false, false, false);
-            double engineAllFlagsPerSec = MeasureEngineThroughput(aggregates, zoneCount, true, true, true);
+            double legacyPerSec = MeasureLegacyThroughput(aggregates, partCount);
+            double engineDefaultPerSec = MeasureEngineThroughput(aggregates, partCount, false, false);
 
             Console.WriteLine($"legacy              : {legacyPerSec,12:N0} completed aggregates/sec (1 thread)");
             Console.WriteLine($"engine (default)    : {engineDefaultPerSec,12:N0} completed aggregates/sec (1 thread)");
-            Console.WriteLine($"engine (all flags)  : {engineAllFlagsPerSec,12:N0} completed aggregates/sec (1 thread)");
 
             File.WriteAllLines(Path.Combine(resultsDir, "exp7_throughput.csv"), new[]
             {
                 "Config,CompletedAggregatesPerSecond",
                 $"Legacy,{legacyPerSec:F0}",
                 $"Engine_Default,{engineDefaultPerSec:F0}",
-                $"Engine_AllFlags,{engineAllFlagsPerSec:F0}",
             }, Encoding.UTF8);
         }
 
         // Each iteration builds one complete, independent aggregate (root +
-        // base + spec + soft limits + N zones) and counts it only once the
-        // subscriber actually fires - so this measures end-to-end completed
-        // aggregates, not raw Upsert calls.
-        private static double MeasureEngineThroughput(int aggregates, int zoneCount, bool affectedOnly, bool isolate, bool suppress)
+        // base + spec + soft limits + N synthetic parts) and counts it only
+        // once the subscriber actually fires - so this measures end-to-end
+        // completed aggregates, not raw Upsert calls.
+        private static double MeasureEngineThroughput(int aggregates, int partCount, bool affectedOnly, bool isolate)
         {
-            var h = new EngineHarness(affectedOnly, isolate, suppress);
+            var h = new EngineHarness(affectedOnly, isolate);
             long completed = 0;
             Action<RootId, AggregateSnapshot> onEmit = (_, __) => completed++;
-            h.Engine.SubscribeRootKind(h.MountKind, onEmit);
+            h.Engine.SubscribeRootKind(h.LinearMountKind, onEmit);
 
             // Warm up JIT and let the allocator settle before timing.
-            FeedEngineAggregates(h, 0, 200, zoneCount);
+            FeedEngineAggregates(h, 0, 200, partCount);
             completed = 0;
 
             var sw = Stopwatch.StartNew();
-            FeedEngineAggregates(h, 1_000_000, aggregates, zoneCount);
+            FeedEngineAggregates(h, 1_000_000, aggregates, partCount);
             sw.Stop();
 
             if (completed < aggregates)
@@ -121,43 +118,43 @@ namespace AggregationEngine.Benchmarks
             return completed / sw.Elapsed.TotalSeconds;
         }
 
-        private static void FeedEngineAggregates(EngineHarness h, long idBase, int count, int zoneCount)
+        private static void FeedEngineAggregates(EngineHarness h, long idBase, int count, int partCount)
         {
             for (int i = 0; i < count; i++)
             {
                 long baseId = idBase + (long)i * 1000;
                 var actual = new ActualMount { SourceId = baseId + 1 };
-                var spec = new Specification { SourceId = baseId + 2 };
-                var softLimits = new SoftLimits { SourceId = baseId + 3, MountSourceId = baseId };
+                var spec = new LinearMountSpecification { SourceId = baseId + 2 };
+                var softLimits = new LinearSoftLimits { SourceId = baseId + 3, LinearMountSourceId = baseId };
 
                 h.Engine.Upsert(h.ActualMountKind, actual);
                 h.Engine.Upsert(h.SpecificationKind, spec);
                 h.Engine.Upsert(h.SoftLimitsKind, softLimits);
-                for (int z = 0; z < zoneCount; z++)
-                    h.Engine.Upsert(h.InhibitZoneKind, new InhibitZone { SourceId = baseId + 100 + z, MountSourceId = baseId });
+                for (int p = 0; p < partCount; p++)
+                    h.Engine.Upsert(h.PartKind, new MountPart { SourceId = baseId + 100 + p, LinearMountSourceId = baseId });
 
-                h.Engine.Upsert(h.MountKind, new Mount
+                h.Engine.Upsert(h.LinearMountKind, new LinearMount
                 {
                     SourceId = baseId,
                     ActualMountSourceId = actual.SourceId,
                     SpecificationSourceId = spec.SourceId,
                     SoftLimitsSourceId = softLimits.SourceId,
-                    InhibitZoneSourceIds = Enumerable.Range(0, zoneCount).Select(z => baseId + 100 + z).ToArray(),
+                    PartSourceIds = Enumerable.Range(0, partCount).Select(p => baseId + 100 + p).ToArray(),
                 });
             }
         }
 
-        private static double MeasureLegacyThroughput(int aggregates, int zoneCount)
+        private static double MeasureLegacyThroughput(int aggregates, int partCount)
         {
             var agg = new LegacyAggregator();
             long completed = 0;
-            agg.OnMountComplete += _ => completed++;
+            agg.OnLinearMountComplete += _ => completed++;
 
-            FeedLegacyAggregates(agg, 0, 200, zoneCount);
+            FeedLegacyAggregates(agg, 0, 200, partCount);
             completed = 0;
 
             var sw = Stopwatch.StartNew();
-            FeedLegacyAggregates(agg, 2_000_000, aggregates, zoneCount);
+            FeedLegacyAggregates(agg, 2_000_000, aggregates, partCount);
             sw.Stop();
 
             if (completed < aggregates)
@@ -166,28 +163,28 @@ namespace AggregationEngine.Benchmarks
             return completed / sw.Elapsed.TotalSeconds;
         }
 
-        private static void FeedLegacyAggregates(LegacyAggregator agg, long idBase, int count, int zoneCount)
+        private static void FeedLegacyAggregates(LegacyAggregator agg, long idBase, int count, int partCount)
         {
             for (int i = 0; i < count; i++)
             {
                 long baseId = idBase + (long)i * 1000;
                 var actual = new ActualMount { SourceId = baseId + 1 };
-                var spec = new Specification { SourceId = baseId + 2 };
-                var softLimits = new SoftLimits { SourceId = baseId + 3, MountSourceId = baseId };
+                var spec = new LinearMountSpecification { SourceId = baseId + 2 };
+                var softLimits = new LinearSoftLimits { SourceId = baseId + 3, LinearMountSourceId = baseId };
 
                 agg.OnActualMount(actual);
                 agg.OnSpecification(spec);
                 agg.OnSoftLimits(softLimits);
-                for (int z = 0; z < zoneCount; z++)
-                    agg.OnInhibitZone(new InhibitZone { SourceId = baseId + 100 + z, MountSourceId = baseId });
+                for (int p = 0; p < partCount; p++)
+                    agg.OnMountPart(new MountPart { SourceId = baseId + 100 + p, LinearMountSourceId = baseId });
 
-                agg.OnMount(new Mount
+                agg.OnLinearMount(new LinearMount
                 {
                     SourceId = baseId,
                     ActualMountSourceId = actual.SourceId,
                     SpecificationSourceId = spec.SourceId,
                     SoftLimitsSourceId = softLimits.SourceId,
-                    InhibitZoneSourceIds = Enumerable.Range(0, zoneCount).Select(z => baseId + 100 + z).ToArray(),
+                    PartSourceIds = Enumerable.Range(0, partCount).Select(p => baseId + 100 + p).ToArray(),
                 });
             }
         }

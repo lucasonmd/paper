@@ -35,7 +35,7 @@ namespace UsageExample
             SubscribeTopics(engine, participant, kinds);
 
             // --- 3. completed aggregates -> application logic -------------
-            engine.SubscribeRootKind(kinds["C_Rotational_Mount"], OnMountAggregateCompleted);
+            engine.SubscribeRootKind(kinds["C_Linear_Mount"], OnMountAggregateCompleted);
 
             Console.WriteLine($"Module loaded: {kinds.Count} topic kinds registered.");
             Console.WriteLine($"DDS readers created for {participant.CreatedTopics.Count} topics:");
@@ -60,12 +60,12 @@ namespace UsageExample
         {
             // Topic names follow the NGVA convention
             // "<PIM package>__<class>" (AEP-4754 Vol V, NGVA_DM_027).
-            Route<C_Rotational_Mount>(engine, participant, kinds, "Mount__C_Rotational_Mount", "C_Rotational_Mount");
+            Route<C_Linear_Mount>(engine, participant, kinds, "Mount__C_Linear_Mount", "C_Linear_Mount");
             Route<C_Actual_Mount>(engine, participant, kinds, "Mount__C_Actual_Mount", "C_Actual_Mount");
-            Route<C_Rotational_Mount_Specification>(engine, participant, kinds, "Mount__C_Rotational_Mount_Specification", "C_Rotational_Mount_Specification");
-            Route<C_Rotational_Soft_Limits>(engine, participant, kinds, "Mount__C_Rotational_Soft_Limits", "C_Rotational_Soft_Limits");
-            Route<C_Movement_Inhibit_Zone>(engine, participant, kinds, "Mount__C_Movement_Inhibit_Zone", "C_Movement_Inhibit_Zone");
-            Route<C_Rotational_Target_Position>(engine, participant, kinds, "Mount__C_Rotational_Target_Position", "C_Rotational_Target_Position");
+            Route<C_Linear_Mount_Specification>(engine, participant, kinds, "Mount__C_Linear_Mount_Specification", "C_Linear_Mount_Specification");
+            Route<C_Linear_Soft_Limits>(engine, participant, kinds, "Mount__C_Linear_Soft_Limits", "C_Linear_Soft_Limits");
+            Route<C_Linear_Target_Position>(engine, participant, kinds, "Mount__C_Linear_Target_Position", "C_Linear_Target_Position");
+            Route<C_Mount_Part>(engine, participant, kinds, "Mount__C_Mount_Part", "C_Mount_Part");
         }
 
         /// <summary>
@@ -92,10 +92,11 @@ namespace UsageExample
         }
 
         /// <summary>
-        /// Called once a rotational mount aggregate is complete: the mount
-        /// itself, its base topic, its specification and its soft limits have
-        /// all arrived, every bidirectional reference agrees in both
-        /// directions, and any optional parts present are included.
+        /// Called once a linear mount aggregate is complete: the mount
+        /// itself, its base topic and its specification - the parts Fig. 6
+        /// declares with multiplicity 1 - have all arrived, every
+        /// bidirectional reference agrees in both directions, and any
+        /// optional parts present are included.
         ///
         /// The snapshot is the assembled aggregate. Read the parts with
         /// snapshot.TryGetOne&lt;T&gt;(kind, out var part) for single-valued

@@ -1,6 +1,6 @@
-﻿N,Legacy,Engine_Default,Engine_EmitOnlyAffected,Engine_EmitOnlyAffected_Suppress
-1,20,20,20,0
-2,20,40,20,0
-5,20,100,20,0
-10,20,200,20,0
-20,20,400,20,0
+﻿N,Republishes,Notifications,PerRepublish
+1,20,20,1
+2,20,40,2
+5,20,100,5
+10,20,200,10
+20,20,400,20

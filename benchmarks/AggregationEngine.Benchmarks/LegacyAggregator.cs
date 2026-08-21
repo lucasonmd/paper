@@ -20,22 +20,22 @@ namespace AggregationEngine.Benchmarks
     //    measured against the engine's default (reachability-based) fan-out.
     public sealed class LegacyAggregator
     {
-        private readonly Dictionary<long, Mount> _mounts = new Dictionary<long, Mount>();
+        private readonly Dictionary<long, LinearMount> _mounts = new Dictionary<long, LinearMount>();
         private readonly Dictionary<long, ActualMount> _actualMounts = new Dictionary<long, ActualMount>();
-        private readonly Dictionary<long, Specification> _specifications = new Dictionary<long, Specification>();
-        private readonly Dictionary<long, SoftLimits> _softLimits = new Dictionary<long, SoftLimits>();
-        private readonly Dictionary<long, InhibitZone> _zones = new Dictionary<long, InhibitZone>();
-        private readonly Dictionary<long, TargetPosition> _targetPositions = new Dictionary<long, TargetPosition>();
+        private readonly Dictionary<long, LinearMountSpecification> _specifications = new Dictionary<long, LinearMountSpecification>();
+        private readonly Dictionary<long, LinearSoftLimits> _softLimits = new Dictionary<long, LinearSoftLimits>();
+        private readonly Dictionary<long, MountPart> _parts = new Dictionary<long, MountPart>();
+        private readonly Dictionary<long, LinearTargetPosition> _targetPositions = new Dictionary<long, LinearTargetPosition>();
 
         // Hand-written reverse index: required because Specification is a
         // Shared Aggregation part and carries no back-reference of its own.
         private readonly Dictionary<long, HashSet<long>> _mountsBySpec = new Dictionary<long, HashSet<long>>();
-        private readonly Dictionary<long, List<InhibitZone>> _zonesByMount = new Dictionary<long, List<InhibitZone>>();
+        private readonly Dictionary<long, List<MountPart>> _partsByLinearMount = new Dictionary<long, List<MountPart>>();
 
         public int NotificationCount;
-        public event Action<MountAggregate>? OnMountComplete;
+        public event Action<LinearMountAggregate>? OnLinearMountComplete;
 
-        public void OnMount(Mount m)
+        public void OnLinearMount(LinearMount m)
         {
             _mounts[m.SourceId] = m;
 
@@ -60,7 +60,7 @@ namespace AggregationEngine.Benchmarks
             // asymmetric with Specification to mirror real legacy code.)
         }
 
-        public void OnSpecification(Specification s)
+        public void OnSpecification(LinearMountSpecification s)
         {
             _specifications[s.SourceId] = s;
 
@@ -71,28 +71,28 @@ namespace AggregationEngine.Benchmarks
             }
         }
 
-        public void OnSoftLimits(SoftLimits s)
+        public void OnSoftLimits(LinearSoftLimits s)
         {
             _softLimits[s.SourceId] = s;
-            TryComplete(s.MountSourceId);
+            TryComplete(s.LinearMountSourceId);
         }
 
-        public void OnInhibitZone(InhibitZone z)
+        public void OnMountPart(MountPart p)
         {
-            _zones[z.SourceId] = z;
-            if (!_zonesByMount.TryGetValue(z.MountSourceId, out var list))
+            _parts[p.SourceId] = p;
+            if (!_partsByLinearMount.TryGetValue(p.LinearMountSourceId, out var list))
             {
-                list = new List<InhibitZone>();
-                _zonesByMount[z.MountSourceId] = list;
+                list = new List<MountPart>();
+                _partsByLinearMount[p.LinearMountSourceId] = list;
             }
-            list.Add(z);
-            TryComplete(z.MountSourceId);
+            list.Add(p);
+            TryComplete(p.LinearMountSourceId);
         }
 
-        public void OnTargetPosition(TargetPosition t)
+        public void OnTargetPosition(LinearTargetPosition t)
         {
             _targetPositions[t.SourceId] = t;
-            TryComplete(t.MountSourceId);
+            TryComplete(t.LinearMountSourceId);
         }
 
         private void TryComplete(long mountId)
@@ -100,33 +100,36 @@ namespace AggregationEngine.Benchmarks
             if (!_mounts.TryGetValue(mountId, out var mount)) return;
             if (!_actualMounts.TryGetValue(mount.ActualMountSourceId, out var actual)) return;
             if (!_specifications.TryGetValue(mount.SpecificationSourceId, out var spec)) return;
-            if (!_softLimits.TryGetValue(mount.SoftLimitsSourceId, out var softLimits)) return;
+            LinearSoftLimits? softLimits = null;
+            if (mount.SoftLimitsSourceId.HasValue &&
+                !_softLimits.TryGetValue(mount.SoftLimitsSourceId.Value, out softLimits))
+                return; // optional, but a declared reference must be present
 
-            TargetPosition? targetPosition = null;
+            LinearTargetPosition? targetPosition = null;
             if (mount.TargetPositionSourceId.HasValue &&
                 !_targetPositions.TryGetValue(mount.TargetPositionSourceId.Value, out targetPosition))
                 return; // optional, but if referenced it must be present
 
-            var zones = new List<InhibitZone>();
-            foreach (var zoneId in mount.InhibitZoneSourceIds)
+            var parts = new List<MountPart>();
+            foreach (var partId in mount.PartSourceIds)
             {
-                if (!_zones.TryGetValue(zoneId, out var z)) return;
-                zones.Add(z);
+                if (!_parts.TryGetValue(partId, out var p)) return;
+                parts.Add(p);
             }
 
-            var result = new MountAggregate
+            var result = new LinearMountAggregate
             {
-                MountSourceId = mountId,
-                Mount = mount,
+                LinearMountSourceId = mountId,
+                LinearMount = mount,
                 ActualMount = actual,
-                Specification = spec,
-                SoftLimits = softLimits,
-                TargetPosition = targetPosition,
-                InhibitZones = zones,
+                LinearMountSpecification = spec,
+                LinearSoftLimits = softLimits,
+                LinearTargetPosition = targetPosition,
+                Parts = parts,
             };
 
             NotificationCount++;
-            OnMountComplete?.Invoke(result);
+            OnLinearMountComplete?.Invoke(result);
         }
     }
 }

@@ -6,11 +6,11 @@
 
 | 구분 | 경로 | 줄 수 | 설명 |
 |---|---|---:|---|
-| 본체 | `src/TopicManager.Extensions/AggregationEngine.cs` | 1,177 | 집계 엔진 본체 |
+| 본체 | `src/TopicManager.Extensions/AggregationEngine.cs` | 1,138 | 집계 엔진 본체 |
 | 본체 | `src/TopicManager.Extensions/JsonModuleLoader.cs` | 221 | 모듈 정의(JSON) 로더 |
-| 사용 예 | `registration/UsageExample/` | 약 250 | 사용 방법을 보이는 예제 |
+| 사용 예 | `registration/UsageExample/` | 약 310 | 사용 방법을 보이는 예제 |
 
-합계 약 1,650줄.
+합계 약 1,670줄.
 
 ## UsageExample 구성
 
@@ -18,7 +18,7 @@
 
 | 파일 | 내용 |
 |---|---|
-| `MountTopics.cs` | 토픽 클래스 정의 (NGVA `C_Rotational_Mount` 집계를 단순화) |
+| `MountTopics.cs` | 토픽 클래스 정의 (NGVA `C_Linear_Mount` 집계를 단순화) |
 | `Mount.module.json` | 토픽 종류와 참조 관계 선언 |
 | `DdsMock.cs` | DDS 수신 API 대역 (`IDataReader<T>`, `CreateReader<T>`) |
 | `Program.cs` | 위 셋을 엮는 코드 |
@@ -36,7 +36,7 @@
 
 Module loaded: 6 topic kinds registered.
 DDS readers created for 6 topics:
-  - Mount__C_Rotational_Mount
+  - Mount__C_Linear_Mount
   ...
 ```
 
@@ -66,12 +66,18 @@ DDS readers created for 6 topics:
 - 집계 수신 함수(`OnMountAggregateCompleted`)는 의도적으로 비워
   두었습니다. 애플리케이션마다 달라지는 부분이므로, 예제에서는 호출
   지점과 사용 방법만 주석으로 설명합니다.
+- 토픽 구조는 AEP-4754 Vol V, Fig. 6(3.6.3절, "NGVA Class Model Example:
+  Mount Data Model Domain Fragment")의 `Linear_Mount` 집계를 따랐습니다.
+  다만 해당 도식에는 0..* 다중성의 연관이 없어, 엔진이 지원하는 다중성
+  네 가지를 모두 보이기 위해 `C_Mount_Part`라는 0..* 토픽 하나를 예제
+  전용으로 추가하였습니다. 표준에 대응 클래스가 없다는 점을
+  `MountTopics.cs` 주석에도 명시해 두었습니다.
 
 ## 저장소의 나머지 내용
 
 등록 대상이 아닙니다. 참고용으로만 남겨 둡니다.
 
-- `samples/` — 기능별 검증 프로그램
+- `samples/` — 기능별 검증 프로그램(완결성 규칙 회귀 테스트 `AggregationEngine.CompletenessCheck` 포함)
 - `benchmarks/` — 성능 측정
 - `tools/` — 모듈 정의(JSON) 작성 보조 도구
 - `paper/` — 논문 원고

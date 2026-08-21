@@ -57,26 +57,26 @@ namespace AggregationEngine.ReflectionSample
 
     // A mount whose zero-or-many reference is held in the vendor sequence
     // type rather than an array, with composite identifiers as elements -
-    // i.e. the exact combination in C_Rotational_Mount's
-    // A_movementInhibitZones_sourceID.
-    public sealed class SeqMount
+    // i.e. the exact combination NGVA uses for a 0..* reference such as
+    // C_Rotational_Mount's A_movementInhibitZones_sourceID.
+    public sealed class SeqLinearMount
     {
         public T_IdentifierType A_sourceID;
         public T_IdentifierType A_specification_sourceID;
 
         [Bound(100)]
-        public ISequence<T_IdentifierType> A_movementInhibitZones_sourceID =
+        public ISequence<T_IdentifierType> A_parts_sourceID =
             new BoundedSequence<T_IdentifierType>();
     }
 
-    public sealed class SeqSpecification
+    public sealed class SeqLinearMountSpecification
     {
         public T_IdentifierType A_sourceID;
     }
 
-    public sealed class SeqInhibitZone
+    public sealed class SeqMountPart
     {
         public T_IdentifierType A_sourceID;
-        public T_IdentifierType A_mount_sourceID;
+        public T_IdentifierType A_linearMount_sourceID;
     }
 }
