@@ -5,6 +5,70 @@ Measured on: local dev machine, .NET 8, `dotnet run -c Release`,
 actual run of the committed benchmark code (`Program.cs`); raw CSVs are in
 `results/`.
 
+## 2026-08-21 (later) — Experiment 2 rebuilt; it was measuring the harness
+
+Review of the paper flagged that its stated protocol (repetitions, medians,
+alternating arms) did not exist in `RunExperiment2()`, which took one
+unrepeated sample per configuration. Fixing that surfaced two deeper faults
+that had been producing the run-to-run disagreement documented above.
+
+**The reported figure was a mean.** `TicksToMicroseconds(ticks, trials)`
+divided the summed ticks of a 3000-call block by 3000. This project runs with
+`ServerGarbageCollection=true`; on a 16-core machine that means collections
+are rare but large, so a single collection landing inside a block carried the
+whole figure. That is the "back-to-back runs inflate everything ~2x" effect
+recorded above -- not thermal behaviour after all, or not only. EXP2 now
+records every call and reports the **median of the per-call samples**, which
+a handful of paused calls cannot move.
+
+**The sweep contaminated itself.** One process measuring all seven sizes runs
+~100 measurement blocks, each rebuilding a snapshot of up to 800 members 3000
+times. The heap grows across the sweep, and under server GC whichever sizes
+came last read high: with per-call medians but a single process, V=100 and
+V=200 held a 5% spread across repetitions while V=400 and V=800 swung 1.8x.
+EXP2 now runs **one aggregate size per process** (`--exp2 --size V`, driven by
+`run-exp2.sh`), appending repetitions to `results/exp2_raw_repetitions.csv`;
+`--exp2 --summarize` folds that into per-size medians.
+
+The two arms alternate inside each process so both meet the same cache and
+heap state, the first run after a build is discarded, and runs are spaced.
+
+### Current numbers
+
+5 repetitions per size, 500 warmup + 3000 timed calls each.
+
+| V | legacy (us) | engine (us) | ratio | spread legacy / engine |
+|---:|---:|---:|---:|---|
+| 0 | 0.10 | 4.6 | 46x | 2.00 / 1.35 |
+| 10 | 0.30 | 12.1 | 40x | 3.00 / 7.74 |
+| 50 | 0.80 | 7.5 | 9x | 1.88 / 6.94 |
+| 100 | 1.40 | 14.9 | 11x | 5.20 / 2.86 |
+| 200 | 2.80 | 29.0 | 10x | 4.00 / 1.11 |
+| 400 | 5.40 | 59.7 | 11x | 4.57 / 1.05 |
+| 800 | 10.60 | 121.3 | 11x | 1.73 / 1.94 |
+
+Both sides are linear here -- each doubling of V roughly doubles both -- so
+the multiple is a constant factor rather than something that degrades with
+aggregate size, and it holds at 10-11x across V=100..800.
+
+Do not quote a multiple below V=100. One Stopwatch tick is 0.1 us (EXP6), so
+at small aggregate sizes the legacy figure sits within a few ticks and is an
+upper bound on the true cost; a ratio taken there has an unresolvable
+denominator. The paper quotes 121.3 us against 10.6 us at V=800 and gives the
+band across V=100..800 rather than a single-point number.
+
+**State the GC mode with any legacy figure.** The legacy path allocates a
+fresh member list and result object per call, and this project sets
+`ServerGarbageCollection=true`. The same V=800 workload measures ~8.4 us per
+call under workstation GC against ~12.3 us under server GC. Ad-hoc harnesses
+that omit the setting therefore report a baseline ~1.5x cheaper than the one
+the benchmark project produces, which makes their ratios incomparable.
+
+`results/exp2_raw_repetitions.csv` carries every repetition behind these
+medians, so the spread is inspectable rather than asserted.
+
+---
+
 ## 2026-08-21 — engine optimization; every timing figure below is superseded
 
 `EmitIfComplete` was walking the aggregate graph three times per Upsert

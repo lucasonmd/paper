@@ -19,8 +19,30 @@ namespace AggregationEngine.Benchmarks
             // --exp2 runs only the aggregate-size sweep, so the ratio can be
             // re-measured across several thermally settled runs without
             // paying for the whole suite each time.
+            //
+            // --exp2 --size V measures a single aggregate size and appends its
+            // repetitions to the raw CSV. Aggregate sizes are meant to be run
+            // one per process: a single process that sweeps every size does
+            // ~100 measurement blocks, each churning a snapshot of up to 800
+            // members 3000 times, and under server GC the growing heap makes
+            // whichever sizes are measured last look 1.5-2x more expensive
+            // than they are. Per-size isolation is what makes this experiment
+            // reproducible; run.cmd drives the loop.
+            //
+            // --exp2 --summarize folds that raw CSV into the per-size medians.
             if (Array.IndexOf(args, "--exp2") >= 0)
             {
+                int sizeArg = Array.IndexOf(args, "--size");
+                if (sizeArg >= 0 && sizeArg + 1 < args.Length)
+                {
+                    RunExperiment2Size(int.Parse(args[sizeArg + 1]));
+                    return;
+                }
+                if (Array.IndexOf(args, "--summarize") >= 0)
+                {
+                    SummarizeExperiment2();
+                    return;
+                }
                 RunExperiment2();
                 return;
             }
@@ -143,26 +165,161 @@ namespace AggregationEngine.Benchmarks
         // -----------------------------------------------------------------
         // Experiment 2
         // -----------------------------------------------------------------
+        // Repetitions of the whole legacy/engine pair per aggregate size. The
+        // arms alternate inside one process so both meet the same cache, heap
+        // and thermal state -- measuring one arm to completion and then the
+        // other lets a drift between the two halves masquerade as a
+        // difference between the implementations. The reported figure is the
+        // median over repetitions; every repetition is also written out, so
+        // the spread behind that median is inspectable.
+        private const int Exp2Reps = 5;
+        private const int Exp2Trials = 3000;
+        private const int Exp2Warmup = 500;
+
+        private static readonly int[] Exp2Sizes = { 0, 10, 50, 100, 200, 400, 800 };
+        private const string Exp2RawCsv = "exp2_raw_repetitions.csv";
+        private const string Exp2SummaryCsv = "exp2_scaling_vs_size.csv";
+
+        private static void PrintExp2Environment()
+        {
+            Console.WriteLine($"protocol: {Exp2Reps} alternating repetitions, " +
+                              $"{Exp2Warmup} warmup + {Exp2Trials} timed Upsert calls each, " +
+                              $"per-call median reported");
+            Console.WriteLine($"runtime : {System.Runtime.InteropServices.RuntimeInformation.FrameworkDescription}, " +
+                              $"{System.Runtime.InteropServices.RuntimeInformation.OSDescription}, " +
+                              $"{Environment.ProcessorCount} logical cores, " +
+                              $"server GC {System.Runtime.GCSettings.IsServerGC}");
+        }
+
+        // One aggregate size, one process. Appends this size's repetitions to
+        // the raw CSV so the driver script can run the sizes independently.
+        private static void RunExperiment2Size(int v)
+        {
+            PrintExp2Environment();
+
+            var path = Path.Combine(ResultsDir, Exp2RawCsv);
+            var lines = new List<string>();
+            if (!File.Exists(path))
+                lines.Add("Parts,Rep,Legacy_us,Engine_Default_us,Engine_IsolateBoundaries_us");
+
+            var legacy = new double[Exp2Reps];
+            var engine = new double[Exp2Reps];
+            var isolate = new double[Exp2Reps];
+
+            for (int r = 0; r < Exp2Reps; r++)
+            {
+                GC.Collect();
+                GC.WaitForPendingFinalizers();
+                GC.Collect();
+
+                legacy[r] = MeasureSteadyState_Legacy(v, Exp2Warmup, Exp2Trials);
+                engine[r] = MeasureSteadyState_Engine(v, Exp2Warmup, Exp2Trials, false, false);
+                isolate[r] = MeasureSteadyState_Engine(v, Exp2Warmup, Exp2Trials, false, true);
+
+                lines.Add($"{v},{r + 1},{legacy[r]:F3},{engine[r]:F3},{isolate[r]:F3}");
+            }
+
+            File.AppendAllLines(path, lines, Encoding.UTF8);
+
+            Console.WriteLine($"parts={v,4}  legacy={Median(legacy),8:F2}us  " +
+                              $"engine(default)={Median(engine),8:F2}us  " +
+                              $"engine(+isolate)={Median(isolate),8:F2}us");
+            Console.WriteLine($"            legacy reps [{string.Join(" ", legacy.Select(x => x.ToString("F2")))}]" +
+                              $"  engine reps [{string.Join(" ", engine.Select(x => x.ToString("F1")))}]");
+        }
+
+        // Folds the raw per-repetition CSV into per-size medians.
+        private static void SummarizeExperiment2()
+        {
+            var path = Path.Combine(ResultsDir, Exp2RawCsv);
+            if (!File.Exists(path))
+            {
+                Console.WriteLine("no raw repetitions to summarize: " + path);
+                return;
+            }
+
+            var bySize = new SortedDictionary<int, List<double[]>>();
+            foreach (var line in File.ReadAllLines(path).Skip(1))
+            {
+                if (line.Length == 0) continue;
+                var f = line.Split(',');
+                int v = int.Parse(f[0]);
+                if (!bySize.TryGetValue(v, out var list))
+                {
+                    list = new List<double[]>();
+                    bySize[v] = list;
+                }
+                list.Add(new[] { double.Parse(f[2]), double.Parse(f[3]), double.Parse(f[4]) });
+            }
+
+            var rows = new List<string> { "Parts,Legacy_us,Engine_Default_us,Engine_IsolateBoundaries_us,Reps" };
+            foreach (var kv in bySize)
+            {
+                double l = Median(kv.Value.Select(a => a[0]).ToArray());
+                double e = Median(kv.Value.Select(a => a[1]).ToArray());
+                double i = Median(kv.Value.Select(a => a[2]).ToArray());
+                rows.Add($"{kv.Key},{l:F3},{e:F3},{i:F3},{kv.Value.Count}");
+                Console.WriteLine($"parts={kv.Key,4}  legacy={l,8:F2}us  engine(default)={e,8:F2}us  " +
+                                  $"engine(+isolate)={i,8:F2}us  (n={kv.Value.Count})");
+            }
+            File.WriteAllLines(Path.Combine(ResultsDir, Exp2SummaryCsv), rows, Encoding.UTF8);
+        }
+
         private static void RunExperiment2()
         {
             int[] sizes = { 0, 10, 50, 100, 200, 400, 800 };
-            const int trials = 3000;
-            const int warmup = 500;
 
             var rows = new List<string> { "Parts,Legacy_us,Engine_Default_us,Engine_IsolateBoundaries_us" };
+            var raw = new List<string> { "Parts,Rep,Legacy_us,Engine_Default_us,Engine_IsolateBoundaries_us" };
+
+            Console.WriteLine($"protocol: {Exp2Reps} alternating repetitions per size, " +
+                              $"{Exp2Warmup} warmup + {Exp2Trials} timed Upsert calls each, median reported");
+            Console.WriteLine($"runtime : {System.Runtime.InteropServices.RuntimeInformation.FrameworkDescription}, " +
+                              $"{System.Runtime.InteropServices.RuntimeInformation.OSDescription}, " +
+                              $"{Environment.ProcessorCount} logical cores, " +
+                              $"server GC {System.Runtime.GCSettings.IsServerGC}");
+            Console.WriteLine();
 
             foreach (var v in sizes)
             {
-                double legacyUs = MeasureSteadyState_Legacy(v, warmup, trials);
-                double engineDefaultUs = MeasureSteadyState_Engine(v, warmup, trials, false, false);
-                double engineIsolateUs = MeasureSteadyState_Engine(v, warmup, trials, false, true);
+                var legacy = new double[Exp2Reps];
+                var engine = new double[Exp2Reps];
+                var isolate = new double[Exp2Reps];
 
-                Console.WriteLine($"parts={v,4}  legacy={legacyUs,8:F2}us  engine(default)={engineDefaultUs,8:F2}us  " +
-                                   $"engine(+isolate)={engineIsolateUs,8:F2}us");
-                rows.Add($"{v},{legacyUs:F3},{engineDefaultUs:F3},{engineIsolateUs:F3}");
+                for (int r = 0; r < Exp2Reps; r++)
+                {
+                    // Settle allocations from the previous repetition so they
+                    // are not collected inside the next timed region.
+                    GC.Collect();
+                    GC.WaitForPendingFinalizers();
+                    GC.Collect();
+
+                    legacy[r] = MeasureSteadyState_Legacy(v, Exp2Warmup, Exp2Trials);
+                    engine[r] = MeasureSteadyState_Engine(v, Exp2Warmup, Exp2Trials, false, false);
+                    isolate[r] = MeasureSteadyState_Engine(v, Exp2Warmup, Exp2Trials, false, true);
+
+                    raw.Add($"{v},{r + 1},{legacy[r]:F3},{engine[r]:F3},{isolate[r]:F3}");
+                }
+
+                double lm = Median(legacy), em = Median(engine), im = Median(isolate);
+
+                Console.WriteLine($"parts={v,4}  legacy={lm,8:F2}us  engine(default)={em,8:F2}us  " +
+                                  $"engine(+isolate)={im,8:F2}us");
+                Console.WriteLine($"            legacy reps [{string.Join(" ", legacy.Select(x => x.ToString("F2")))}]" +
+                                  $"  engine reps [{string.Join(" ", engine.Select(x => x.ToString("F1")))}]");
+                rows.Add($"{v},{lm:F3},{em:F3},{im:F3}");
             }
 
             File.WriteAllLines(Path.Combine(ResultsDir, "exp2_scaling_vs_size.csv"), rows, Encoding.UTF8);
+            File.WriteAllLines(Path.Combine(ResultsDir, "exp2_raw_repetitions.csv"), raw, Encoding.UTF8);
+        }
+
+        private static double Median(double[] values)
+        {
+            var copy = (double[])values.Clone();
+            Array.Sort(copy);
+            int n = copy.Length;
+            return n % 2 == 1 ? copy[n / 2] : (copy[n / 2 - 1] + copy[n / 2]) / 2.0;
         }
 
         private static double MeasureSteadyState_Legacy(int partCount, int warmup, int trials)
@@ -191,15 +348,15 @@ namespace AggregationEngine.Benchmarks
             for (int i = 0; i < warmup; i++) agg.OnLinearMount(mount);
 
             var sw = new Stopwatch();
-            long ticks = 0;
+            var samples = new long[trials];
             for (int i = 0; i < trials; i++)
             {
                 sw.Restart();
                 agg.OnLinearMount(mount);
                 sw.Stop();
-                ticks += sw.ElapsedTicks;
+                samples[i] = sw.ElapsedTicks;
             }
-            return TicksToMicroseconds(ticks, trials);
+            return MedianMicroseconds(samples);
         }
 
         private static double MeasureSteadyState_Engine(int partCount, int warmup, int trials, bool affectedOnly, bool isolate)
@@ -231,15 +388,15 @@ namespace AggregationEngine.Benchmarks
             for (int i = 0; i < warmup; i++) h.Engine.Upsert(h.LinearMountKind, mount);
 
             var sw = new Stopwatch();
-            long ticks = 0;
+            var samples = new long[trials];
             for (int i = 0; i < trials; i++)
             {
                 sw.Restart();
                 h.Engine.Upsert(h.LinearMountKind, mount);
                 sw.Stop();
-                ticks += sw.ElapsedTicks;
+                samples[i] = sw.ElapsedTicks;
             }
-            return TicksToMicroseconds(ticks, trials);
+            return MedianMicroseconds(samples);
         }
 
         // -----------------------------------------------------------------
@@ -447,6 +604,28 @@ namespace AggregationEngine.Benchmarks
         // -----------------------------------------------------------------
         // Helpers
         // -----------------------------------------------------------------
+        // Median of the individual timed calls, not the mean of the block.
+        // The project runs with server GC, so collections are infrequent but
+        // large; averaging lets one collection that lands inside the loop
+        // carry the whole figure, which is why repeated runs of this
+        // experiment used to disagree by 2-4x. The median is unmoved by a
+        // handful of paused calls and is the statistic the paper quotes.
+        //
+        // Resolution note: one Stopwatch tick is 0.1 us. Where a per-call
+        // median lands at zero ticks the true cost is below what this harness
+        // can resolve, and the figure is reported as such rather than as a
+        // number that invites a ratio.
+        private static double MedianMicroseconds(long[] ticks)
+        {
+            var copy = (long[])ticks.Clone();
+            Array.Sort(copy);
+            int n = copy.Length;
+            double mid = n % 2 == 1
+                ? copy[n / 2]
+                : (copy[n / 2 - 1] + copy[n / 2]) / 2.0;
+            return mid * (1_000_000.0 / Stopwatch.Frequency);
+        }
+
         private static double TicksToMicroseconds(long ticks, int count) =>
             count == 0 ? 0 : (ticks / (double)Stopwatch.Frequency) * 1_000_000.0 / count;
 
